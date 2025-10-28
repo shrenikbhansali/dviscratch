@@ -1,3 +1,7 @@
+Top level note - you are using the latest version of the transformers package in your enviroment. The actual deployment enviroment will be using Transformers transformers==4.33.3. If you are searching the web for any documentation or reference, make sure you are looking at transformers==4.33.3. This should also hold for the implementation - you are implementing as if we had transformers==4.33.3, not the latest version. 
+
+Also remember the existence of files like adapter.py - make sure you are using the already implemented methods, and not just re-implementing them and so on. 
+
 ---
 
 ## 0 · Mission (60-second brief)
