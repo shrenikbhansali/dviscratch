@@ -18,6 +18,7 @@ STEPS=${STEPS:-6}
 TEMPERATURE=${TEMPERATURE:-0.0}
 PROMPTS=${PROMPTS:-data/smoke_prompts.jsonl}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-128}
+MODEL_PATH=${MODEL_PATH:-$MODEL_ID}
 
 TIME_BIN="/usr/bin/time"
 TIME_FORMAT="%E real, %U user, %S sys, %M KB maxrss"
@@ -91,11 +92,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import pathlib
+import sys
 from pathlib import Path
 import random
 
 import torch
 from transformers import AutoTokenizer
+
+# Ensure the project root is importable when this script lives under runs/
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from evaluation import inference_kangaroo as kangaroo
 from kangaroo.kangaroo_model import KangarooModel
@@ -212,17 +220,189 @@ GREEDY_ERR="runs/baseline/greedy.err"
 GREEDY_TIME="runs/baseline/greedy.time"
 GREEDY_EXIT=0
 GREEDY_STATUS="skipped"
+GREEDY_DRIVER=""
 
 if [ -f evaluation/inference_baseline.py ]; then
-  GREEDY_CMD=(python -m evaluation.inference_baseline \
-    --model-id "$MODEL_ID" \
-    --temperature "$TEMPERATURE" --seed "$SEED" \
-    --prompts-jsonl "$PROMPTS")
-  set +e
-  run_with_timing "greedy" "$GREEDY_OUT" "$GREEDY_ERR" "$GREEDY_TIME" "${GREEDY_CMD[@]}"
-  GREEDY_EXIT=$?
-  set -e
-  GREEDY_STATUS="completed"
+  GREEDY_PROMPTS_SUPPORTED=$(python - <<'PY'
+from pathlib import Path
+
+path = Path("evaluation/inference_baseline.py")
+if not path.exists():
+    print(0)
+else:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        text = ""
+    print(int("--prompts-jsonl" in text))
+PY
+)
+  GREEDY_PROMPTS_SUPPORTED=${GREEDY_PROMPTS_SUPPORTED:-0}
+  GREEDY_PROMPTS_SUPPORTED=${GREEDY_PROMPTS_SUPPORTED//[[:space:]]/}
+
+  if [ "$GREEDY_PROMPTS_SUPPORTED" = "1" ]; then
+    GREEDY_DRIVER="evaluation.inference_baseline"
+    GREEDY_SEED_SUPPORTED=$(python - <<'PY'
+from pathlib import Path
+
+text = ""
+try:
+    text = Path("evaluation/inference_baseline.py").read_text(encoding="utf-8", errors="ignore")
+except Exception:
+    pass
+print(int("--seed" in text))
+PY
+)
+    GREEDY_SEED_SUPPORTED=${GREEDY_SEED_SUPPORTED:-0}
+    GREEDY_SEED_SUPPORTED=${GREEDY_SEED_SUPPORTED//[[:space:]]/}
+    EXTRA_GREEDY_FLAGS=()
+    if [ "$GREEDY_SEED_SUPPORTED" = "1" ]; then
+      EXTRA_GREEDY_FLAGS+=(--seed "$SEED")
+    fi
+    GREEDY_CMD=(python -m evaluation.inference_baseline \
+      --model-path "$MODEL_PATH" \
+      --model-id "$MODEL_ID" \
+      --temperature "$TEMPERATURE" \
+      "${EXTRA_GREEDY_FLAGS[@]}" \
+      --prompts-jsonl "$PROMPTS")
+  else
+    GREEDY_DRIVER="inline_greedy_runner"
+    GREEDY_FALLBACK_SCRIPT="runs/baseline/_greedy_driver.py"
+    cat <<'PY' > "$GREEDY_FALLBACK_SCRIPT"
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import random
+import sys
+from pathlib import Path
+
+import torch
+from transformers import AutoTokenizer
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from kangaroo.kangaroo_model import KangarooModel
+
+
+def normalize_adapter(path: str | None) -> tuple[str, str | None]:
+    if path is None:
+        return "none", None
+    lowered = path.strip().lower()
+    if lowered in {"", "none"}:
+        return "none", None
+    return "load", path
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def load_prompts(path: Path) -> list[str]:
+    prompts: list[str] = []
+    if not path.exists():
+        return prompts
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            prompt = obj.get("prompt")
+            if prompt is None:
+                continue
+            prompts.append(prompt)
+    return prompts
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Inline greedy runner for smoke prompts")
+    parser.add_argument("--model-id", required=True)
+    parser.add_argument("--model-path")
+    parser.add_argument("--adapter-path", default="none")
+    parser.add_argument("--exitlayer", type=int, required=True)
+    parser.add_argument("--temperature", type=float, required=True)
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--prompts-jsonl", required=True)
+    parser.add_argument("--max-new-tokens", type=int, default=128)
+    args = parser.parse_args()
+
+    adapter_mode, adapter_path = normalize_adapter(args.adapter_path)
+    seed_everything(args.seed)
+
+    source_id = args.model_path or args.model_id
+    dtype = "float16" if torch.cuda.is_available() else "float32"
+    model = KangarooModel(
+        model_id=source_id,
+        adapter_mode=adapter_mode,
+        adapter_path=adapter_path,
+        exit_layer=args.exitlayer,
+        dtype=dtype,
+    )
+    base_model = model.base_model
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+
+    device = next(base_model.parameters()).device
+
+    prompts = load_prompts(Path(args.prompts_jsonl))
+    do_sample = float(args.temperature) > 0.0
+
+    for index, prompt in enumerate(prompts, start=1):
+        encoded = tokenizer(prompt, return_tensors="pt")
+        encoded = {key: value.to(device) for key, value in encoded.items()}
+        with torch.no_grad():
+            outputs = base_model.generate(
+                **encoded,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=do_sample,
+                temperature=args.temperature,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        generated = outputs[0][encoded["input_ids"].shape[1]:]
+        text = tokenizer.decode(generated, skip_special_tokens=True).strip()
+        print(f"### Prompt {index}")
+        print(prompt)
+        print("---")
+        print(text)
+        print()
+
+
+if __name__ == "__main__":
+    main()
+PY
+    GREEDY_CMD=(python "$GREEDY_FALLBACK_SCRIPT" \
+      --model-id "$MODEL_ID" \
+      --model-path "$MODEL_PATH" \
+      --adapter-path "$ADAPTER_PATH" \
+      --exitlayer "$EXITLAYER" \
+      --temperature "$TEMPERATURE" \
+      --seed "$SEED" \
+      --prompts-jsonl "$PROMPTS" \
+      --max-new-tokens "$MAX_NEW_TOKENS")
+  fi
+
+  if [ -n "$GREEDY_CMD" ]; then
+    set +e
+    run_with_timing "greedy" "$GREEDY_OUT" "$GREEDY_ERR" "$GREEDY_TIME" "${GREEDY_CMD[@]}"
+    GREEDY_EXIT=$?
+    set -e
+    GREEDY_STATUS="completed"
+  else
+    echo "evaluation/inference_baseline.py present but CLI unsupported; skipping greedy baseline" > runs/baseline/greedy.SKIPPED
+  fi
 else
   echo "evaluation/inference_baseline.py not found; skipping greedy baseline" > runs/baseline/greedy.SKIPPED
 fi
@@ -234,7 +414,7 @@ if ! "${KANGAROO_CMD[@]}" > "$KANGAROO_RERUN_OUT" 2> "$KANGAROO_RERUN_ERR"; then
 fi
 
 export SEED MODEL_ID ADAPTER_PATH EXITLAYER THRESHOLD STEPS TEMPERATURE PROMPTS KANGAROO_DRIVER MAX_NEW_TOKENS
-export KANGAROO_EXIT GREEDY_EXIT GREEDY_STATUS
+export KANGAROO_EXIT GREEDY_EXIT GREEDY_STATUS GREEDY_DRIVER
 python - <<'PY'
 from __future__ import annotations
 
@@ -328,9 +508,14 @@ if not kangaroo_rss:
 
 greedy_real, greedy_rss = parse_time(BASE / "greedy.time")
 if os.environ.get("GREEDY_STATUS") != "completed":
-    greedy_note = "skipped"
+    driver = os.environ.get("GREEDY_DRIVER")
+    if driver:
+        greedy_note = f"driver={driver} skipped"
+    else:
+        greedy_note = "skipped"
 else:
-    greedy_note = f"exit={os.environ.get('GREEDY_EXIT')}"
+    driver = os.environ.get("GREEDY_DRIVER") or "evaluation.inference_baseline"
+    greedy_note = f"driver={driver} (exit={os.environ.get('GREEDY_EXIT')})"
 
 kangaroo_note = (
     f"driver={os.environ.get('KANGAROO_DRIVER')} "
