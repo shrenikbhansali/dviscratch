@@ -422,6 +422,9 @@ else:
 
 readme_path = BASE / "README.md"
 readme_path.write_text("\n".join(readme_lines).strip() + "\n", encoding="utf-8")
+
+print(f"README written to {readme_path}")
+print(f"Determinism status: {det_status.upper()}")
 PY
 
 printf 'Kangaroo exit code: %s\n' "$KANGAROO_EXIT"
@@ -430,3 +433,4 @@ if [ "$GREEDY_STATUS" = "completed" ]; then
 else
   printf 'Greedy baseline status: %s\n' "$GREEDY_STATUS"
 fi
+printf 'Artifacts directory: %s\n' "runs/baseline"
