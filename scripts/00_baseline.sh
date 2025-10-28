@@ -37,7 +37,7 @@ run_with_timing() {
       return $?
     fi
   else
-    if ! python - "$out_file" "$err_file" "$time_file" "${label}" "$@" <<'PY'; then
+    if ! python - "$out_file" "$err_file" "$time_file" "${label}" "$@" <<'PY'
 import os
 import subprocess
 import sys
