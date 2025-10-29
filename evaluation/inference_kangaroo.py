@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Iterable, Optional
+from typing import Iterable, List, Optional, Tuple
 
 if __package__ is None or __package__ == "":
     sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -20,6 +20,7 @@ from kangaroo.cli_utils import (
     resolve_adapter_mode,
     str2bool,
 )
+from kangaroo.draft_trace import DraftBlockTrace
 from kangaroo.kangaroo_model import KangarooModel
 
 
@@ -50,6 +51,105 @@ def reset_counters() -> None:
     tokens_accepted_total = 0
 
 
+def _draft_block(
+    model: KangarooModel,
+    global_tokens: torch.Tensor,
+    global_position_ids: torch.Tensor,
+    start_index: int,
+    hidden_state: torch.Tensor,
+    previous_exited_hidden_states: Optional[torch.Tensor],
+    adapter_past_key_values,
+    steps: int,
+    threshold: float,
+) -> Tuple[
+    torch.Tensor,
+    int,
+    torch.Tensor,
+    Tuple[Tuple[torch.Tensor, torch.Tensor], ...],
+    DraftBlockTrace,
+]:
+    """Run the shallow drafter for up to ``steps`` tokens and capture hk states."""
+
+    scratch = DraftBlockTrace.empty(
+        d_model=hidden_state.shape[-1],
+        max_len=max(0, steps),
+        device=hidden_state.device,
+    )
+
+    carry_hidden_states = previous_exited_hidden_states
+    exited_hidden_states: Optional[torch.Tensor] = None
+    adapter_cache = adapter_past_key_values
+    adapter_hidden_state = hidden_state
+    end_index = start_index + 1
+    predict_score = float("inf")
+
+    for step in range(1 + steps):
+        in_tokens_small = global_tokens[:, end_index - 1 : end_index]
+        cache_length = adapter_cache[0][0].shape[2]
+        assert cache_length <= end_index - 1, f"{adapter_cache[0][0].shape} - {end_index - 1}"
+        if cache_length < end_index - 1:
+            position_ids = global_position_ids[:, start_index - 1 : end_index]
+            source_hidden_states = (
+                carry_hidden_states
+                if carry_hidden_states is not None
+                else exited_hidden_states
+            )
+            hidden_state_early_last = (
+                source_hidden_states[:, -1:, :]
+                if source_hidden_states is not None
+                else None
+            )
+        else:
+            position_ids = global_position_ids[:, end_index - 1 : end_index]
+            hidden_state_early_last = None
+
+        hidden_state_early = model.base_model.forward_draft_or_large_model(
+            in_tokens_small=in_tokens_small[:, -1:], position_ids=position_ids[:, -1:]
+        )
+
+        exited_hidden_states = (
+            hidden_state_early
+            if exited_hidden_states is None
+            else torch.cat([exited_hidden_states, hidden_state_early], dim=1)
+        )
+
+        if hidden_state_early_last is not None:
+            hidden_state_early = torch.cat([hidden_state_early_last, hidden_state_early], dim=1)
+
+        if step == 0:
+            carry_hidden_states = None
+
+        if step == steps or (step > 0 and predict_score < threshold):
+            break
+
+        adapter_hidden_state, adapter_cache = model.adapter_model.forward_early_stop(
+            inputs_embeds=hidden_state_early,
+            position_ids=position_ids,
+            past_key_values=adapter_cache,
+            use_cache=True,
+        )
+
+        hk_slice = adapter_hidden_state[:, -1:, :]
+        if hasattr(model, "drafter_head"):
+            predict_logits = model.drafter_logits_from_hk(hk_slice).float()
+        else:
+            predict_logits = model.head_model(hk_slice).float()
+
+        next_token_tensor = torch.argmax(predict_logits[:, -1, :], dim=-1)
+        if next_token_tensor.numel() != 1:
+            raise RuntimeError("Draft tracing currently supports batch_size=1.")
+        next_token_id = int(next_token_tensor.item())
+
+        scratch.append(hk_slice, next_token_id)
+        global_tokens[:, end_index] = next_token_tensor
+
+        end_index += 1
+        predict_score = predict_logits.softmax(dim=-1).max().item()
+
+    draft_trace = scratch.finalize()
+    return exited_hidden_states, end_index, adapter_hidden_state, adapter_cache, draft_trace
+
+
 def kangaroo_forward(
     inputs,
     model,
@@ -60,6 +160,7 @@ def kangaroo_forward(
     EARLY_STOP_LAYER: int = 2,
     SPECULATIVE_DECODING_STEPS: int = 6,
     threshold: float = 0.6,
+    dvi_debug_hk: bool = False,
 ):
     context_tokens = inputs.input_ids
     device = context_tokens.device
@@ -92,6 +193,8 @@ def kangaroo_forward(
         )
 
     total_inference_steps = 0
+    block_traces: List[DraftBlockTrace] = []
+    previous_exited_hidden_states: Optional[torch.Tensor] = None
 
     with torch.no_grad():
         max_infer_steps = min(max_length, start_index + max_new_tokens)
@@ -99,59 +202,24 @@ def kangaroo_forward(
 
         while start_index < max_infer_steps - 1 - SPECULATIVE_DECODING_STEPS:
             start_index_copy = start_index
-            end_index = start_index + 1
 
-            # STEP 1: Small model decoding
-            for step in range(1 + SPECULATIVE_DECODING_STEPS):
-                assert (
-                    adapter_past_key_values[0][0].shape[2] <= end_index - 1
-                ), "{} - {}".format(adapter_past_key_values[0][0].shape, end_index - 1)
-                in_tokens_small = global_tokens[:, end_index - 1 : end_index]
-                if adapter_past_key_values[0][0].shape[2] < end_index - 1:
-                    # Once all drafted tokens are accepted, the KV-cache of the last draft token for
-                    # the adapter is missing (see Kangaroo paper).
-                    position_ids = global_position_ids[:, start_index - 1 : end_index]
-                    hidden_state_early_last = exited_hidden_states[:, -1:, :]
-                else:
-                    position_ids = global_position_ids[:, end_index - 1 : end_index]
-                    hidden_state_early_last = None
-
-                hidden_state_early = model.base_model.forward_draft_or_large_model(
-                    in_tokens_small=in_tokens_small[:, -1:], position_ids=position_ids[:, -1:]
-                )
-
-                if step == 0:
-                    exited_hidden_states = None
-
-                exited_hidden_states = (
-                    hidden_state_early
-                    if exited_hidden_states is None
-                    else torch.cat([exited_hidden_states, hidden_state_early], dim=1)
-                )
-
-                if hidden_state_early_last is not None:
-                    hidden_state_early = torch.cat([hidden_state_early_last, hidden_state_early], dim=1)
-
-                # early exiting
-                if step == SPECULATIVE_DECODING_STEPS or (step > 0 and predict_score < threshold):
-                    break
-
-                hidden_state, adapter_past_key_values = model.adapter_model.forward_early_stop(
-                    inputs_embeds=hidden_state_early,
-                    position_ids=position_ids,
-                    past_key_values=adapter_past_key_values,
-                    use_cache=True,
-                )
-
-                hk_slice = hidden_state[:, -1:, :]
-                if hasattr(model, "drafter_head"):
-                    predict_logits = model.drafter_logits_from_hk(hk_slice).float()
-                else:
-                    predict_logits = model.head_model(hk_slice).float()
-                global_tokens[:, end_index] = torch.argmax(predict_logits[:, -1, :], dim=-1)
-
-                end_index += 1
-                predict_score = predict_logits.softmax(dim=-1).max().item()
+            (
+                exited_hidden_states,
+                end_index,
+                _adapter_hidden_state,
+                adapter_past_key_values,
+                draft_trace,
+            ) = _draft_block(
+                model=model,
+                global_tokens=global_tokens,
+                global_position_ids=global_position_ids,
+                start_index=start_index,
+                hidden_state=hidden_state,
+                previous_exited_hidden_states=previous_exited_hidden_states,
+                adapter_past_key_values=adapter_past_key_values,
+                steps=SPECULATIVE_DECODING_STEPS,
+                threshold=threshold,
+            )
 
             # STEP2: Big model inference
             position_ids = global_position_ids[:, start_index:end_index]
@@ -183,6 +251,13 @@ def kangaroo_forward(
             accepted_tokens = start_index - start_index_copy
             record_block_result(accepted_tokens)
             accept_length_list.append(accepted_tokens)
+            if dvi_debug_hk:
+                print(
+                    f"[DVI] hk captured: L={len(draft_trace)}, "
+                    f"shape={draft_trace.hk_fp16.shape}, dtype={draft_trace.hk_fp16.dtype}"
+                )
+            block_traces.append(draft_trace)
+            previous_exited_hidden_states = exited_hidden_states
             hidden_state = hidden_state[:, : output_lenght - (end_index - start_index), :]
 
             # STEP 4: Post process KV-cache
@@ -207,7 +282,7 @@ def kangaroo_forward(
     output_ids = global_tokens[0, : start_index + 1].tolist()
     new_token = start_index - context_length + 1
     idx = len(accept_length_list) - 1
-    return [output_ids], new_token, idx, accept_length_list
+    return [output_ids], new_token, idx, accept_length_list, block_traces
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -459,6 +534,29 @@ def test_counters_increment():
     assert tokens_accepted_total == 3
 
 
+def test_draft_block_trace_roundtrip():
+    device = torch.device("cpu")
+    scratch = DraftBlockTrace.empty(d_model=4, max_len=3, device=device)
+    vec0 = torch.arange(4, dtype=torch.float32, device=device)
+    vec1 = torch.arange(4, dtype=torch.float16, device=device) + 1
+
+    scratch.append(vec0, 11)
+    scratch.append(vec1, 13)
+    trace = scratch.finalize()
+
+    assert len(trace) == 2
+    assert trace.tokens == [11, 13]
+    assert trace.hk_fp16.dtype == torch.float16
+    torch.testing.assert_close(trace.hk_state_of(1).float(), vec0.float(), atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(trace.hk_state_of(2).float(), vec1.float(), atol=1e-3, rtol=1e-3)
+
+    try:
+        trace.hk_state_of(3)
+        raise AssertionError("hk_state_of should raise when index is out of range")
+    except IndexError:
+        pass
+
+
 if __name__ == "__main__":
     from evaluation.eval import reorg_answer_file, run_eval
 
@@ -503,6 +601,7 @@ if __name__ == "__main__":
             threshold=args.threshold,
             SPECULATIVE_DECODING_STEPS=args.steps,
             EARLY_STOP_LAYER=args.exitlayer,
+            dvi_debug_hk=args.dvi_debug_hk,
         )
 
         reorg_answer_file(answer_file)
