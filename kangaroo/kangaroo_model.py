@@ -21,6 +21,7 @@ from kangaroo.adapter import (
     _make_causal_mask,
 )
 from kangaroo.earlyexit import EarlyExitLlamaForCausalLM
+from kangaroo.drafter_head import DrafterHead
 
 
 class IdentityDecoderLayer(nn.Module):
@@ -202,6 +203,8 @@ class IdentityAdapterModel(nn.Module):
             return hidden_states, tuple(next_decoder_cache)
 
         return hidden_states
+
+
 class KangarooModel(nn.Module):
     """Wrapper that owns the verifier backbone and shallow adapter."""
 
@@ -335,3 +338,63 @@ class KangarooModel(nn.Module):
 
     def forward(self):
         raise NotImplementedError
+
+    def attach_drafter_head(self, *, r: int, alpha: float) -> None:
+        """Attach a drafter head cloned from ``self.head_model`` with frozen base weights."""
+
+        if hasattr(self, "drafter_head"):
+            return
+
+        base_weight = getattr(self.head_model, "weight", None)
+        if base_weight is None:
+            raise AttributeError("head_model must expose a weight tensor for cloning")
+
+        vocab_size, hidden_size = base_weight.shape
+        bias_tensor = getattr(self.head_model, "bias", None)
+        use_bias = bias_tensor is not None
+
+        drafter = DrafterHead(hidden_size, vocab_size, r=r, alpha=alpha, bias=use_bias)
+
+        target_device = base_weight.device
+        target_dtype = base_weight.dtype
+        drafter = drafter.to(device=target_device, dtype=target_dtype)
+
+        drafter.proj.base.weight.data.copy_(base_weight.data)
+        drafter.proj.base.weight.requires_grad_(False)
+
+        if use_bias:
+            assert drafter.proj.base.bias is not None
+            drafter.proj.base.bias.data.copy_(bias_tensor.data)
+            drafter.proj.base.bias.requires_grad_(False)
+
+        self.drafter_head = drafter
+
+    def drafter_logits_from_hk(self, hk: "torch.Tensor") -> "torch.Tensor":
+        """Return drafter logits for hidden states ``hk``; requires ``attach_drafter_head`` first."""
+
+        if not hasattr(self, "drafter_head"):
+            raise RuntimeError("drafter_head is not attached; call attach_drafter_head() first.")
+
+        base_weight = self.head_model.weight
+        hidden_size = base_weight.shape[1]
+        if hk.shape[-1] != hidden_size:
+            raise ValueError(
+                f"hk hidden size mismatch: expected {hidden_size}, got {hk.shape[-1]}"
+            )
+
+        drafter_weight = self.drafter_head.proj.base.weight
+        if hk.device != drafter_weight.device or hk.dtype != drafter_weight.dtype:
+            raise ValueError(
+                "hk tensor device/dtype mismatch with drafter head: "
+                f"hk device={hk.device}, dtype={hk.dtype}; "
+                f"expected device={drafter_weight.device}, dtype={drafter_weight.dtype}"
+            )
+
+        return self.drafter_head(hk)
+
+    def dvi_trainable_params(self) -> "List[nn.Parameter]":
+        """Return the LoRA trainable parameters of the drafter head, if present."""
+
+        if not hasattr(self, "drafter_head"):
+            return []
+        return list(self.drafter_head.lora_params())

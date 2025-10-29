@@ -18,6 +18,7 @@ from kangaroo.cli_utils import (
     normalize_adapter_path,
     normalize_model_flags,
     resolve_adapter_mode,
+    str2bool,
 )
 from kangaroo.kangaroo_model import KangarooModel
 
@@ -142,7 +143,11 @@ def kangaroo_forward(
                     use_cache=True,
                 )
 
-                predict_logits = model.head_model(hidden_state[:, -1:, :]).float()
+                hk_slice = hidden_state[:, -1:, :]
+                if hasattr(model, "drafter_head"):
+                    predict_logits = model.drafter_logits_from_hk(hk_slice).float()
+                else:
+                    predict_logits = model.head_model(hk_slice).float()
                 global_tokens[:, end_index] = torch.argmax(predict_logits[:, -1, :], dim=-1)
 
                 end_index += 1
@@ -267,6 +272,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of speculative decoding steps per block.",
     )
     parser.add_argument(
+        "--dvi-lora-rank",
+        type=int,
+        default=8,
+        help="LoRA rank used when attaching the drafter head.",
+    )
+    parser.add_argument(
+        "--dvi-lora-alpha",
+        type=float,
+        default=None,
+        help="LoRA scaling alpha; defaults to the configured rank when omitted.",
+    )
+    parser.add_argument(
+        "--dvi-attach-drafter",
+        type=str2bool,
+        default=None,
+        help="Whether to attach the drafter LoRA head (defaults to true when DVI is active).",
+    )
+    parser.add_argument(
         "--dtype",
         type=str,
         default="float16",
@@ -293,6 +316,14 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     args.adapter_mode = adapter_mode
     args.adapter_path = adapter_path
     args.model_path = args.model_id
+
+    if args.dvi_lora_alpha is None:
+        args.dvi_lora_alpha = float(args.dvi_lora_rank)
+
+    attach_default = bool(args.dvi_online) or bool(getattr(args, "load_lora", ""))
+    if args.dvi_attach_drafter is None:
+        args.dvi_attach_drafter = attach_default
+
     return args
 
 
@@ -444,6 +475,9 @@ if __name__ == "__main__":
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
     do_sample = False
+
+    if args.dvi_attach_drafter or args.dvi_online or bool(args.load_lora):
+        model.attach_drafter_head(r=args.dvi_lora_rank, alpha=args.dvi_lora_alpha)
 
     assert not args.answer_file
     os.makedirs(f"data/{args.bench_name}/{args.model_id}", exist_ok=True)
