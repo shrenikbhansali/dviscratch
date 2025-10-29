@@ -1,2 +1,5 @@
 *
 !.gitkeep
+!step2_smoke/
+step2_smoke/*
+!step2_smoke/README.md
