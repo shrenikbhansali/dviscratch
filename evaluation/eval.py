@@ -107,13 +107,24 @@ def get_model_answers(
             try:
                 torch.cuda.synchronize()
                 start_time = time.time()
-                output_ids, new_token, idx, accept_length_tree = forward_func(
+                forward_result = forward_func(
                     inputs,
                     model,
                     tokenizer,
                     max_new_tokens,
                     **kwargs,
                 )
+                if len(forward_result) == 5:
+                    (
+                        output_ids,
+                        new_token,
+                        idx,
+                        accept_length_tree,
+                        block_traces,
+                    ) = forward_result
+                else:
+                    output_ids, new_token, idx, accept_length_tree = forward_result
+                    block_traces = []
                 torch.cuda.synchronize()
                 total_time = time.time() - start_time
                 output_ids = output_ids[0][len(input_ids[0]):]
@@ -177,13 +188,24 @@ def get_model_answers(
                 try:
                     torch.cuda.synchronize()
                     start_time = time.time()
-                    output_ids, new_token, idx, accept_length_tree = forward_func(
+                    forward_result = forward_func(
                         inputs,
                         model,
                         tokenizer,
                         max_new_tokens,
                         **kwargs,
                     )
+                    if len(forward_result) == 5:
+                        (
+                            output_ids,
+                            new_token,
+                            idx,
+                            accept_length_tree,
+                            block_traces,
+                        ) = forward_result
+                    else:
+                        output_ids, new_token, idx, accept_length_tree = forward_result
+                        block_traces = []
                     torch.cuda.synchronize()
                     total_time = time.time() - start_time
                     accept_lengths_tree.extend(accept_length_tree)

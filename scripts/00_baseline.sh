@@ -179,7 +179,7 @@ def main() -> None:
         inputs = tokenizer([prompt], return_tensors="pt")
         inputs = inputs.to(device)
         with torch.no_grad():
-            outputs, _, _, _ = kangaroo.kangaroo_forward(
+            forward_result = kangaroo.kangaroo_forward(
                 inputs,
                 model,
                 tokenizer,
@@ -189,6 +189,7 @@ def main() -> None:
                 SPECULATIVE_DECODING_STEPS=args.steps,
                 threshold=args.threshold,
             )
+            outputs = forward_result[0]
         generated = outputs[0][inputs.input_ids.shape[1]:]
         text = tokenizer.decode(generated, skip_special_tokens=True).strip()
         print(f"### Prompt {index}")

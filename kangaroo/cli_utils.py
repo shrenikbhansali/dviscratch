@@ -70,6 +70,12 @@ def add_dvi_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--save-lora-every", type=int, default=0)
     parser.add_argument("--save-lora-path", type=str, default="runs/checkpoints")
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--dvi-debug-hk",
+        type=str2bool,
+        default=False,
+        help="Print shallow hk capture statistics for each draft block.",
+    )
 
 
 def normalize_model_flags(args: argparse.Namespace) -> str:
