@@ -108,6 +108,23 @@ class DVIRingBuffer:
             "total_bytes": float(total_bytes),
         }
 
+    def _check_tensor_device(self, tensor: torch.Tensor, name: str) -> None:
+        """Validate that ``tensor`` resides on the configured device.
+
+        PyTorch treats ``torch.device("cuda")`` and ``torch.device("cuda:0")``
+        as distinct objects even though they resolve to the same hardware. We
+        therefore compare device *type* and explicitly guard the index only
+        when the buffer device carries one. This allows callers to pass tensors
+        created on ``cuda:0`` (the default single GPU) while configuring the
+        buffer with ``device="cuda"``.
+        """
+
+        tensor_device = tensor.device
+        if tensor_device.type != self._device.type:
+            raise ValueError(f"{name} tensor must be on buffer device")
+        if self._device.index is not None and tensor_device.index != self._device.index:
+            raise ValueError(f"{name} tensor must be on buffer device")
+
     def _write_common(
         self,
         idx: int,
@@ -118,8 +135,7 @@ class DVIRingBuffer:
         pos: int,
         is_first_reject: bool,
     ) -> None:
-        if hk.device != self._device:
-            raise ValueError("hk tensor must be on buffer device")
+        self._check_tensor_device(hk, "hk")
         if hk.dim() != 1 or hk.shape[0] != self._d_model:
             raise ValueError(f"hk must have shape [{self._d_model}]")
         if reward not in (0, 1):
@@ -155,8 +171,7 @@ class DVIRingBuffer:
     ) -> None:
         if self._store != "full":
             raise RuntimeError("push_full called on buffer configured for topk storage")
-        if z_phi.device != self._device:
-            raise ValueError("z_phi tensor must be on buffer device")
+        self._check_tensor_device(z_phi, "z_phi")
         if z_phi.dim() != 1 or z_phi.shape[0] != self._vocab_size:
             raise ValueError(f"z_phi must have shape [{self._vocab_size}]")
 
@@ -179,8 +194,7 @@ class DVIRingBuffer:
     ) -> None:
         if self._store != "topk":
             raise RuntimeError("push_topk called on buffer configured for full storage")
-        if z_phi.device != self._device:
-            raise ValueError("z_phi tensor must be on buffer device")
+        self._check_tensor_device(z_phi, "z_phi")
         if z_phi.dim() != 1 or z_phi.shape[0] != self._vocab_size:
             raise ValueError(f"z_phi must have shape [{self._vocab_size}]")
 
