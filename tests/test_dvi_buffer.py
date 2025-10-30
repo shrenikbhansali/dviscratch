@@ -11,7 +11,9 @@ from dvi.buffer import DVIRingBuffer
 
 
 def _device() -> str:
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        return "cuda:0"
+    return "cpu"
 
 
 def test_topk_capacity_wraparound():
