@@ -3,3 +3,12 @@
 !step2_smoke/
 step2_smoke/*
 !step2_smoke/README.md
+!step3_smoke/
+step3_smoke/*
+!step3_smoke/README.md
+!step5_smoke/
+step5_smoke/*
+!step5_smoke/README.md
+!step6_smoke/
+step6_smoke/*
+!step6_smoke/README.md
