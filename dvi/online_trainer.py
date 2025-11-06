@@ -53,6 +53,10 @@ class OnlineTrainer:
             raise RuntimeError(
                 "Non-LoRA parameters have requires_grad=True: " + ", ".join(offending)
             )
+        for param in self._trainable:
+            if not param.requires_grad:
+                param.requires_grad_(True)
+        self._debug_once = False
 
         if device is None:
             self._device = self._trainable[0].device
@@ -101,6 +105,17 @@ class OnlineTrainer:
 
         with torch.enable_grad():
             draft_logits = self.model.drafter_logits_from_hk(hk)
+            if not draft_logits.requires_grad:
+                raise RuntimeError(
+                    "drafter logits are detached from autograd; ensure LoRA parameters remain trainable."
+                )
+            if not self._debug_once:
+                stats = ", ".join(
+                    f"{tuple(p.shape)}:grad={p.requires_grad}"
+                    for p in self._trainable
+                )
+                print(f"[DVI][debug] trainables -> {stats}, logits require_grad={draft_logits.requires_grad}")
+                self._debug_once = True
             logp = torch.log_softmax(draft_logits.float(), dim=-1)
             nll = -logp[torch.arange(B, device=logp.device), token]
 

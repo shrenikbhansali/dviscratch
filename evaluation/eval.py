@@ -157,7 +157,14 @@ def get_model_answers(
                     output = output.replace("Assistant:", "", 1).strip()
             except RuntimeError as e:
                 print("ERROR question ID: ", question["question_id"])
+                print("  RuntimeError:", repr(e))
                 output = "ERROR"
+                idx = -1
+                new_token = 0
+                accept_length_tree = []
+                block_traces = []
+                torch.cuda.synchronize()
+                total_time = time.time() - start_time
 
             turns.append(output)
             idxs.append(int(idx))
@@ -238,7 +245,14 @@ def get_model_answers(
                         output = output.replace("Assistant:", "", 1).strip()
                 except RuntimeError as e:
                     print("ERROR question ID: ", question["question_id"])
+                    print("  RuntimeError:", repr(e))
                     output = "ERROR"
+                    idx = -1
+                    new_token = 0
+                    accept_length_tree = []
+                    block_traces = []
+                    torch.cuda.synchronize()
+                    total_time = time.time() - start_time
 
                 turns.append(output)
                 idxs.append(int(idx))
@@ -277,4 +291,3 @@ def reorg_answer_file(answer_file):
     with open(answer_file, "w") as fout:
         for qid in qids:
             fout.write(answers[qid])
-

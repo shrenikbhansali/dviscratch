@@ -236,10 +236,13 @@ class KangarooModel(nn.Module):
             EARLY_STOP_LAYER=exit_layer,
         )
         self.base_model = self.base_model.eval()
+        self._freeze_module(self.base_model)
         self.base_config = self.base_model.config
 
         self.head_model = self._resolve_head_model()
+        self._freeze_module(self.head_model)
 
+        self.config = self.base_model.config
         normalized_path = adapter_path
         if adapter_mode == "load":
             self._load_adapter_from_path(normalized_path, exit_layer=exit_layer)
@@ -368,6 +371,13 @@ class KangarooModel(nn.Module):
             drafter.proj.base.bias.requires_grad_(False)
 
         self.drafter_head = drafter
+        if getattr(self.drafter_head.proj, "rank", 0) <= 0:
+            raise ValueError("drafter LoRA rank must be positive.")
+        if getattr(self.drafter_head.proj, "alpha", 0.0) == 0.0:
+            raise ValueError("drafter LoRA alpha must be non-zero.")
+        self._restore_drafter_gradients()
+        self._ensure_drafter_trainable()
+        self._validate_trainable_layout()
 
     def drafter_logits_from_hk(self, hk: "torch.Tensor") -> "torch.Tensor":
         """Return drafter logits for hidden states ``hk``; requires ``attach_drafter_head`` first."""
@@ -398,3 +408,41 @@ class KangarooModel(nn.Module):
         if not hasattr(self, "drafter_head"):
             return []
         return list(self.drafter_head.lora_params())
+
+    def _restore_drafter_gradients(self) -> None:
+        """Force LoRA parameters to remain trainable even after global freezing."""
+
+        if not hasattr(self, "drafter_head"):
+            return
+        for param in self.drafter_head.lora_params():
+            if param is not None and not param.requires_grad:
+                param.requires_grad_(True)
+
+    def _ensure_drafter_trainable(self) -> None:
+        """Sanity-check that the drafter head exposes trainable LoRA params."""
+
+        trainable = list(self.dvi_trainable_params())
+        if not trainable:
+            raise RuntimeError(
+                "drafter_head has no trainable LoRA parameters; ensure rank/alpha are > 0."
+            )
+        frozen = [p for p in trainable if not p.requires_grad]
+        if frozen:
+            raise RuntimeError(
+                "drafter_head LoRA parameters are unexpectedly frozen; check initialization."
+            )
+
+    def _validate_trainable_layout(self) -> None:
+        """Verify only the drafter LoRA parameters remain trainable."""
+
+        allowed = {id(p) for p in self.dvi_trainable_params()}
+        offending = [
+            name
+            for name, param in self.named_parameters()
+            if param.requires_grad and id(param) not in allowed
+        ]
+        if offending:
+            raise RuntimeError(
+                "Non-LoRA parameters remain trainable after initialization: "
+                + ", ".join(offending)
+            )
