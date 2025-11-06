@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 if __package__ is None or __package__ == "":
     sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -30,6 +30,22 @@ tokens_accepted_total = 0
 COUNTER_LOG_FREQUENCY = 50
 
 
+def _make_default_dvi_runtime() -> Dict[str, Any]:
+    return {
+        "enabled": False,
+        "buffer": None,
+        "trainer": None,
+        "store_mode": "topk",
+        "batch_size": 0,
+        "update_every": 1,
+        "logits_dtype": torch.float16,
+        "max_ms": 0.0,
+    }
+
+
+DVI_RUNTIME: Dict[str, Any] = _make_default_dvi_runtime()
+
+
 def record_block_result(tokens_accepted: int) -> None:
     """Update driver counters after each verify/commit block."""
     global global_step, blocks_processed, tokens_accepted_total
@@ -49,6 +65,225 @@ def reset_counters() -> None:
     global_step = 0
     blocks_processed = 0
     tokens_accepted_total = 0
+
+
+def configure_dvi_runtime(args: argparse.Namespace, model: KangarooModel, device: torch.device) -> None:
+    """Initialize (or disable) the DVI runtime structures based on *args*."""
+
+    global DVI_RUNTIME
+
+    if not getattr(args, "dvi_online", False):
+        DVI_RUNTIME = _make_default_dvi_runtime()
+        return
+
+    from dvi.buffer import DVIRingBuffer
+    from dvi.online_trainer import OnlineTrainer
+    from dvi.schedule import PiecewiseSchedule
+
+    if args.dvi_batch_size <= 0:
+        raise ValueError("--dvi-batch-size must be positive when DVI is enabled")
+    if args.dvi_update_every <= 0:
+        raise ValueError("--dvi-update-every must be positive when DVI is enabled")
+
+    logits_dtype = torch.float16 if args.dvi_logits_dtype == "float16" else torch.float32
+    buffer = DVIRingBuffer(
+        capacity=args.dvi_buffer_size,
+        d_model=model.config.hidden_size,
+        vocab_size=model.config.vocab_size,
+        store=args.dvi_store,
+        topk=args.dvi_topk,
+        logits_dtype=logits_dtype,
+        device=str(device),
+    )
+
+    schedule = PiecewiseSchedule(
+        warmup=args.dvi_warmup_steps,
+        kl0=args.dvi_kl_lambda0,
+        klmin=args.dvi_kl_lambdamin,
+        pgmax=args.dvi_pg_lambda_max,
+    )
+
+    trainer = OnlineTrainer(
+        model,
+        lr=5e-5,
+        tau=args.dvi_tau,
+        schedule=schedule,
+        max_ms=args.max_online_train_ms,
+        store_mode=args.dvi_store,
+        topk=args.dvi_topk,
+        vocab_size=model.config.vocab_size,
+        weight_decay=0.01,
+        grad_clip=1.0,
+        ema_m=0.01,
+        device=device,
+    )
+
+    DVI_RUNTIME = {
+        "enabled": True,
+        "buffer": buffer,
+        "trainer": trainer,
+        "store_mode": args.dvi_store,
+        "batch_size": int(args.dvi_batch_size),
+        "update_every": int(args.dvi_update_every),
+        "logits_dtype": logits_dtype,
+        "max_ms": float(args.max_online_train_ms),
+    }
+
+
+def _extract_block_logits(logits: torch.Tensor, k: int, vocab_size: int, dtype: torch.dtype) -> torch.Tensor:
+    """Return the verifier logits for the drafted block with shape [k, vocab]."""
+
+    if k <= 0:
+        raise ValueError("k must be positive when extracting verifier logits")
+
+    if logits.dim() == 3:
+        block = logits[:, -k:, :].reshape(-1, logits.shape[-1])
+    elif logits.dim() == 2:
+        block = logits[-k:, :]
+    else:
+        raise RuntimeError("Unexpected verifier logits rank")
+
+    if block.shape[0] != k:
+        raise RuntimeError("verifier logits length mismatch")
+    if block.shape[1] != vocab_size:
+        raise RuntimeError("verifier logits vocab size mismatch")
+
+    block = block.detach()
+    if block.dtype != dtype:
+        block = block.to(dtype=dtype)
+    return block
+
+
+def _dvi_process_block(
+    *,
+    model: KangarooModel,
+    draft_trace: DraftBlockTrace,
+    logits: torch.Tensor,
+    accepted_tokens: int,
+    eos_token_id: Optional[int],
+) -> None:
+    """Push accepted/reject tuples for the current speculative block."""
+
+    runtime = DVI_RUNTIME
+    if not runtime.get("enabled", False):
+        return
+
+    buffer = runtime.get("buffer")
+    if buffer is None:
+        return
+
+    k = len(draft_trace)
+    if k == 0:
+        return
+
+    if accepted_tokens < 0:
+        raise RuntimeError("accepted token count cannot be negative")
+    if accepted_tokens > k:
+        raise RuntimeError("accepted token count exceeds drafted length")
+
+    logits_block = _extract_block_logits(
+        logits=logits,
+        k=k,
+        vocab_size=model.config.vocab_size,
+        dtype=runtime["logits_dtype"],
+    )
+
+    eos_accepted = (
+        accepted_tokens > 0
+        and eos_token_id is not None
+        and draft_trace.tokens[accepted_tokens - 1] == eos_token_id
+    )
+
+    store_mode = runtime.get("store_mode", "topk")
+
+    # Push accepted tuples.
+    for pos in range(1, accepted_tokens + 1):
+        hk_state = draft_trace.hk_state_of(pos)
+        token_id = int(draft_trace.tokens[pos - 1])
+        z_phi = logits_block[pos - 1]
+        if store_mode == "full":
+            buffer.push_full(
+                hk=hk_state,
+                token=token_id,
+                z_phi=z_phi,
+                reward=1,
+                pos=pos,
+                is_first_reject=False,
+            )
+        else:
+            buffer.push_topk(
+                hk=hk_state,
+                token=token_id,
+                z_phi=z_phi,
+                reward=1,
+                pos=pos,
+                is_first_reject=False,
+            )
+
+    # Push first reject if applicable.
+    if accepted_tokens < k and not eos_accepted:
+        reject_pos = accepted_tokens + 1
+        hk_state = draft_trace.hk_state_of(reject_pos)
+        token_id = int(draft_trace.tokens[reject_pos - 1])
+        z_phi = logits_block[reject_pos - 1]
+        if store_mode == "full":
+            buffer.push_full(
+                hk=hk_state,
+                token=token_id,
+                z_phi=z_phi,
+                reward=0,
+                pos=reject_pos,
+                is_first_reject=True,
+            )
+        else:
+            buffer.push_topk(
+                hk=hk_state,
+                token=token_id,
+                z_phi=z_phi,
+                reward=0,
+                pos=reject_pos,
+                is_first_reject=True,
+            )
+
+
+def _dvi_maybe_step() -> None:
+    """Run a trainer step on cadence when enough tuples are buffered."""
+
+    runtime = DVI_RUNTIME
+    if not runtime.get("enabled", False):
+        return
+
+    buffer = runtime.get("buffer")
+    trainer = runtime.get("trainer")
+    if buffer is None or trainer is None:
+        return
+
+    batch_size = int(runtime.get("batch_size", 0))
+    if batch_size <= 0 or buffer.size < batch_size:
+        return
+
+    update_every = int(runtime.get("update_every", 1))
+    if update_every <= 0:
+        update_every = 1
+
+    if global_step % update_every != 0:
+        return
+
+    batch = buffer.sample(batch_size)
+    stats = trainer.step(batch, global_step)
+    fill_ratio = buffer.size / buffer.capacity
+    print(
+        "[DVI] step="
+        f"{global_step} loss={stats['loss']:.3f} kd={stats['kd']:.3f} "
+        f"ce={stats['ce']:.3f} pg={stats['pg']:.3f} kl={stats['kl']:.3f} "
+        f"ms={stats['ms']:.2f} acc_ratio={stats['acc_ratio']:.3f} "
+        f"buf={buffer.size}/{buffer.capacity} fill={fill_ratio:.2f}"
+    )
+    if stats["ms"] > runtime.get("max_ms", 0.0):
+        print(
+            "[DVI][warn] trainer step "
+            f"{stats['ms']:.2f}ms > budget {runtime.get('max_ms', 0.0):.2f}ms"
+        )
 
 
 def _draft_block(
@@ -249,6 +484,14 @@ def kangaroo_forward(
                     break
 
             accepted_tokens = start_index - start_index_copy
+            if DVI_RUNTIME.get("enabled", False):
+                _dvi_process_block(
+                    model=model,
+                    draft_trace=draft_trace,
+                    logits=logits,
+                    accepted_tokens=accepted_tokens,
+                    eos_token_id=token_eos,
+                )
             record_block_result(accepted_tokens)
             accept_length_list.append(accepted_tokens)
             if dvi_debug_hk:
@@ -275,6 +518,9 @@ def kangaroo_forward(
                 del adapter_past_key_values_
 
             total_inference_steps += 1
+
+            if DVI_RUNTIME.get("enabled", False):
+                _dvi_maybe_step()
 
             if stop:
                 break
@@ -576,6 +822,18 @@ if __name__ == "__main__":
 
     if args.dvi_attach_drafter or args.dvi_online or bool(args.load_lora):
         model.attach_drafter_head(r=args.dvi_lora_rank, alpha=args.dvi_lora_alpha)
+
+    if args.dvi_online:
+        try:
+            ref_param = next(model.head_model.parameters())
+        except StopIteration as exc:
+            raise RuntimeError(
+                "model.head_model exposes no parameters for device inference"
+            ) from exc
+        dvi_device = ref_param.device
+    else:
+        dvi_device = torch.device("cpu")
+    configure_dvi_runtime(args, model, dvi_device)
 
     assert not args.answer_file
     os.makedirs(f"data/{args.bench_name}/{args.model_id}", exist_ok=True)
