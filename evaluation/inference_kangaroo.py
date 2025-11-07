@@ -22,6 +22,7 @@ from kangaroo.cli_utils import (
 )
 from kangaroo.draft_trace import DraftBlockTrace
 from kangaroo.kangaroo_model import KangarooModel
+from evaluation.sharegpt_eval import ShareGPTConfig, stream_sharegpt_answers
 
 
 global_step = 0
@@ -73,6 +74,8 @@ def configure_dvi_runtime(args: argparse.Namespace, model: KangarooModel, device
     global DVI_RUNTIME
 
     if not getattr(args, "dvi_online", False):
+        if hasattr(model, "set_drafter_trainable"):
+            model.set_drafter_trainable(False)
         DVI_RUNTIME = _make_default_dvi_runtime()
         return
 
@@ -86,6 +89,15 @@ def configure_dvi_runtime(args: argparse.Namespace, model: KangarooModel, device
         raise ValueError("--dvi-update-every must be positive when DVI is enabled")
 
     logits_dtype = torch.float16 if args.dvi_logits_dtype == "float16" else torch.float32
+
+    if hasattr(model, "set_drafter_trainable"):
+        model.set_drafter_trainable(True)
+        trainable_shapes = [
+            (tuple(param.shape), param.requires_grad, param.device, param.dtype)
+            for param in model.dvi_trainable_params()
+        ]
+        print(f"[DVI][debug] enabling online mode with trainables={trainable_shapes}")
+
     buffer = DVIRingBuffer(
         capacity=args.dvi_buffer_size,
         d_model=model.config.hidden_size,
@@ -396,6 +408,7 @@ def kangaroo_forward(
     SPECULATIVE_DECODING_STEPS: int = 6,
     threshold: float = 0.6,
     dvi_debug_hk: bool = False,
+    dvi_debug_blocks: bool = False,
 ):
     context_tokens = inputs.input_ids
     device = context_tokens.device
@@ -403,7 +416,7 @@ def kangaroo_forward(
     batch_size, context_length = context_tokens.shape
     global_tokens = torch.ones((batch_size, max_length), dtype=torch.long, device=device) * token_eos
     global_position_ids = torch.LongTensor([[i for i in range(max_length)]]).to(device)
-    accept_length_list = [1]
+    accept_length_list: List[int] = []
 
     start_index = context_length
     global_tokens[:, :start_index] = context_tokens
@@ -470,20 +483,54 @@ def kangaroo_forward(
             output_tokens = torch.argmax(logits[:, :, :], dim=-1)
 
             # Verification for greedy decoding
-            output_lenght = end_index - start_index
-            for i in range(output_lenght):
-                if (
-                    i == output_lenght - 1
-                    or output_tokens[0, i] == token_eos
-                    or output_tokens[0, i] != global_tokens[0, start_index + 1 + i]
-                ):
-                    global_tokens[0, start_index + 1 + i] = output_tokens[0, i]
-                    start_index = start_index + 1 + i
-                    if output_tokens[0, i] == token_eos:
-                        stop = True
-                    break
+            block_len = len(draft_trace)
+            output_length = output_tokens.shape[1]
+            verifier_block_tokens = output_tokens[0, :output_length].tolist()
+            compare_len = min(block_len, output_length)
+            verifier_tokens = verifier_block_tokens[:compare_len]
+            accepted_tokens = 0
+            reject_reason = "block_end"
+            mismatch_index: Optional[int] = None
 
-            accepted_tokens = start_index - start_index_copy
+            for i in range(compare_len):
+                base_token = verifier_tokens[i]
+                global_tokens[0, start_index + 1 + i] = base_token
+                drafted_token = draft_trace.tokens[i]
+
+                if base_token == drafted_token:
+                    accepted_tokens += 1
+                    if base_token == token_eos:
+                        reject_reason = "eos"
+                        stop = True
+                        break
+                    continue
+
+                reject_reason = "mismatch"
+                mismatch_index = i
+                if base_token == token_eos:
+                    stop = True
+                break
+
+            if reject_reason in {"block_end", "eos"}:
+                # Accepted the entire block (possibly ending on EOS).
+                start_index = start_index_copy + accepted_tokens
+            else:
+                # Advance past the matched prefix plus the verifier token that broke the block.
+                start_index = start_index_copy + accepted_tokens + 1
+
+            # Annotate trace for optional debugging.
+            setattr(draft_trace, "accepted_tokens", accepted_tokens)
+            setattr(draft_trace, "reject_reason", reject_reason)
+            setattr(draft_trace, "verifier_tokens", verifier_block_tokens)
+            setattr(
+                draft_trace,
+                "mismatch_index",
+                mismatch_index if mismatch_index is not None else (
+                    None if reject_reason == "block_end" else accepted_tokens
+                ),
+            )
+
+            accepted_tokens = max(0, min(accepted_tokens, block_len))
             if DVI_RUNTIME.get("enabled", False):
                 _dvi_process_block(
                     model=model,
@@ -494,6 +541,11 @@ def kangaroo_forward(
                 )
             record_block_result(accepted_tokens)
             accept_length_list.append(accepted_tokens)
+            if dvi_debug_blocks:
+                print(
+                    f"[DVI][block] len={block_len} accepted={accepted_tokens} "
+                    f"reason={reject_reason} mismatch={getattr(draft_trace, 'mismatch_index', None)}"
+                )
             if dvi_debug_hk:
                 print(
                     f"[DVI] hk captured: L={len(draft_trace)}, "
@@ -501,7 +553,7 @@ def kangaroo_forward(
                 )
             block_traces.append(draft_trace)
             previous_exited_hidden_states = exited_hidden_states
-            hidden_state = hidden_state[:, : output_lenght - (end_index - start_index), :]
+            hidden_state = hidden_state[:, : output_length - (end_index - start_index), :]
 
             # STEP 4: Post process KV-cache
             if model.base_model.past_key_values[0][0].shape[2] > start_index:
@@ -616,6 +668,56 @@ def build_parser() -> argparse.ArgumentParser:
         default="float16",
         choices=["float32", "float64", "float16", "bfloat16"],
         help="Override the default dtype. If not set, it will use float16 on GPU.",
+    )
+    parser.add_argument(
+        "--sharegpt-jsonl",
+        type=str,
+        default=None,
+        help="Optional ShareGPT JSONL to stream prompts from instead of MT-Bench.",
+    )
+    parser.add_argument("--sharegpt-max-samples", type=int, default=0, help="Limit ShareGPT samples processed.")
+    parser.add_argument("--sharegpt-skip-samples", type=int, default=0, help="Skip this many ShareGPT samples first.")
+    parser.add_argument(
+        "--sharegpt-keep-system",
+        type=str2bool,
+        default=False,
+        help="Keep ShareGPT system prompts in the constructed prompt.",
+    )
+    parser.add_argument(
+        "--sharegpt-use-last-turn",
+        type=str2bool,
+        default=True,
+        help="Emit only the last assistant reply per conversation.",
+    )
+    parser.add_argument(
+        "--sharegpt-max-src-len",
+        type=int,
+        default=2048,
+        help="Truncate ShareGPT prompts to this many characters.",
+    )
+    parser.add_argument(
+        "--sharegpt-max-tgt-len",
+        type=int,
+        default=512,
+        help="Truncate ShareGPT reference answers to this many characters.",
+    )
+    parser.add_argument(
+        "--sharegpt-block-dump",
+        type=str,
+        default=None,
+        help="Optional JSONL file to dump per-block speculation stats (Kangaroo runs only).",
+    )
+    parser.add_argument(
+        "--sharegpt-block-dump-max-tokens",
+        type=int,
+        default=32,
+        help="Truncate drafted/verifier token dumps to this many tokens for debugging.",
+    )
+    parser.add_argument(
+        "--sharegpt-output",
+        type=str,
+        default=None,
+        help="Path to save ShareGPT streaming results (defaults under data/sharegpt_runs).",
     )
     return parser
 
@@ -834,32 +936,71 @@ if __name__ == "__main__":
     else:
         dvi_device = torch.device("cpu")
     configure_dvi_runtime(args, model, dvi_device)
+    grad_names = [name for name, param in model.named_parameters() if param.requires_grad]
+    print(f"[Kangaroo][debug] parameters requiring grad: {grad_names}")
 
-    assert not args.answer_file
-    os.makedirs(f"data/{args.bench_name}/{args.model_id}", exist_ok=True)
-
-    for run in range(3):
-        answer_file = f"data/{args.bench_name}/{args.model_id}/{run}.jsonl"
-        print(f"Output to {answer_file}")
-
-        run_eval(
+    if args.sharegpt_jsonl:
+        safe_model = args.model_id.replace("/", "_")
+        default_out = os.path.join("data", "sharegpt_runs", f"{safe_model}_kangaroo.jsonl")
+        sharegpt_output = args.sharegpt_output or default_out
+        cfg = ShareGPTConfig(
+            path=args.sharegpt_jsonl,
+            max_samples=args.sharegpt_max_samples,
+            skip_samples=args.sharegpt_skip_samples,
+            max_src_len=args.sharegpt_max_src_len,
+            max_tgt_len=args.sharegpt_max_tgt_len,
+            keep_system=args.sharegpt_keep_system,
+            use_last_turn=args.sharegpt_use_last_turn,
+        )
+        stats = stream_sharegpt_answers(
             model=model,
             tokenizer=tokenizer,
             forward_func=kangaroo_forward,
-            model_id=args.model_id,
-            question_file=question_file,
-            question_begin=args.question_begin,
-            question_end=args.question_end,
-            answer_file=answer_file,
+            output_path=sharegpt_output,
             max_new_tokens=args.max_new_tokens,
-            num_choices=args.num_choices,
-            num_gpus_per_model=args.num_gpus_per_model,
-            num_gpus_total=args.num_gpus_total,
-            do_sample=do_sample,
-            threshold=args.threshold,
-            SPECULATIVE_DECODING_STEPS=args.steps,
-            EARLY_STOP_LAYER=args.exitlayer,
-            dvi_debug_hk=args.dvi_debug_hk,
+            sharegpt_cfg=cfg,
+            forward_kwargs={
+                "threshold": args.threshold,
+                "SPECULATIVE_DECODING_STEPS": args.steps,
+                "EARLY_STOP_LAYER": args.exitlayer,
+                "dvi_debug_hk": args.dvi_debug_hk,
+                "dvi_debug_blocks": args.dvi_debug_blocks,
+            },
+            block_dump_path=args.sharegpt_block_dump,
+            block_dump_max_tokens=args.sharegpt_block_dump_max_tokens,
         )
+        print(
+            f"[ShareGPT] completed {stats['processed']} samples "
+            f"(tokens/sec={stats['tokens_per_second']:.2f}, avg_wall={stats['avg_wall_time']:.2f}s)"
+        )
+    else:
+        assert not args.answer_file
+        os.makedirs(f"data/{args.bench_name}/{args.model_id}", exist_ok=True)
 
-        reorg_answer_file(answer_file)
+        for run in range(3):
+            answer_file = f"data/{args.bench_name}/{args.model_id}/{run}.jsonl"
+            print(f"Output to {answer_file}")
+
+            run_eval(
+                model=model,
+                tokenizer=tokenizer,
+                forward_func=kangaroo_forward,
+                model_id=args.model_id,
+                question_file=question_file,
+                question_begin=args.question_begin,
+                question_end=args.question_end,
+                answer_file=answer_file,
+                max_new_tokens=args.max_new_tokens,
+                num_choices=args.num_choices,
+                num_gpus_per_model=args.num_gpus_per_model,
+                num_gpus_total=args.num_gpus_total,
+                do_sample=do_sample,
+                threshold=args.threshold,
+                SPECULATIVE_DECODING_STEPS=args.steps,
+                EARLY_STOP_LAYER=args.exitlayer,
+                dvi_debug_hk=args.dvi_debug_hk,
+                dvi_debug_blocks=args.dvi_debug_blocks,
+                dvi_online=args.dvi_online,
+            )
+
+            reorg_answer_file(answer_file)

@@ -1,13 +1,11 @@
-"""Generate answers with local models.
-
-Usage:
-python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fastchat-t5-3b-v1.0
-"""
+"""Generate answers with local models."""
 import os
 import argparse
 from fastchat.utils import str_to_torch_dtype
+from kangaroo.cli_utils import str2bool
 
 from evaluation.eval import run_eval, reorg_answer_file
+from evaluation.sharegpt_eval import ShareGPTConfig, stream_sharegpt_answers
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -84,6 +82,44 @@ if __name__ == "__main__":
         choices=["float32", "float64", "float16", "bfloat16"],
         help="Override the default dtype. If not set, it will use float16 on GPU.",
     )
+    parser.add_argument(
+        "--sharegpt-jsonl",
+        type=str,
+        default=None,
+        help="Optional ShareGPT JSONL to stream prompts from instead of MT-Bench.",
+    )
+    parser.add_argument("--sharegpt-max-samples", type=int, default=0, help="Limit ShareGPT samples processed.")
+    parser.add_argument("--sharegpt-skip-samples", type=int, default=0, help="Skip this many ShareGPT samples first.")
+    parser.add_argument(
+        "--sharegpt-keep-system",
+        type=str2bool,
+        default=False,
+        help="Keep ShareGPT system prompts in the constructed prompt.",
+    )
+    parser.add_argument(
+        "--sharegpt-use-last-turn",
+        type=str2bool,
+        default=True,
+        help="Emit only the last assistant reply per conversation.",
+    )
+    parser.add_argument(
+        "--sharegpt-max-src-len",
+        type=int,
+        default=2048,
+        help="Truncate ShareGPT prompts to this many characters.",
+    )
+    parser.add_argument(
+        "--sharegpt-max-tgt-len",
+        type=int,
+        default=512,
+        help="Truncate ShareGPT reference answers to this many characters.",
+    )
+    parser.add_argument(
+        "--sharegpt-output",
+        type=str,
+        default=None,
+        help="Path to save ShareGPT streaming results (defaults under data/sharegpt_runs).",
+    )
 
     args = parser.parse_args()
 
@@ -104,26 +140,56 @@ if __name__ == "__main__":
     else:
         do_sample = False
 
-    assert not args.answer_file
-    os.makedirs(f"data/{args.bench_name}/{args.model_id}", exist_ok=True)
-
-    for run in range(3):
-        answer_file = f"data/{args.bench_name}/{args.model_id}/{run}.jsonl"
-        print(f"Output to {answer_file}")
-        run_eval(
+    if args.sharegpt_jsonl:
+        safe_model = args.model_id.replace("/", "_")
+        default_out = os.path.join("data", "sharegpt_runs", f"{safe_model}_vanilla.jsonl")
+        sharegpt_output = args.sharegpt_output or default_out
+        cfg = ShareGPTConfig(
+            path=args.sharegpt_jsonl,
+            max_samples=args.sharegpt_max_samples,
+            skip_samples=args.sharegpt_skip_samples,
+            max_src_len=args.sharegpt_max_src_len,
+            max_tgt_len=args.sharegpt_max_tgt_len,
+            keep_system=args.sharegpt_keep_system,
+            use_last_turn=args.sharegpt_use_last_turn,
+        )
+        stats = stream_sharegpt_answers(
             model=model,
             tokenizer=tokenizer,
             forward_func=baseline_forward,
-            model_id=args.model_id,
-            question_file=question_file,
-            question_begin=args.question_begin,
-            question_end=args.question_end,
-            answer_file=answer_file,
+            output_path=sharegpt_output,
             max_new_tokens=args.max_new_tokens,
-            num_choices=args.num_choices,
-            num_gpus_per_model=args.num_gpus_per_model,
-            num_gpus_total=args.num_gpus_total,
-            temperature=args.temperature,
-            do_sample=do_sample,
+            sharegpt_cfg=cfg,
+            forward_kwargs={
+                "temperature": args.temperature,
+                "do_sample": do_sample,
+            },
         )
-        reorg_answer_file(answer_file)
+        print(
+            f"[ShareGPT][baseline] completed {stats['processed']} samples "
+            f"(tokens/sec={stats['tokens_per_second']:.2f}, avg_wall={stats['avg_wall_time']:.2f}s)"
+        )
+    else:
+        assert not args.answer_file
+        os.makedirs(f"data/{args.bench_name}/{args.model_id}", exist_ok=True)
+
+        for run in range(3):
+            answer_file = f"data/{args.bench_name}/{args.model_id}/{run}.jsonl"
+            print(f"Output to {answer_file}")
+            run_eval(
+                model=model,
+                tokenizer=tokenizer,
+                forward_func=baseline_forward,
+                model_id=args.model_id,
+                question_file=question_file,
+                question_begin=args.question_begin,
+                question_end=args.question_end,
+                answer_file=answer_file,
+                max_new_tokens=args.max_new_tokens,
+                num_choices=args.num_choices,
+                num_gpus_per_model=args.num_gpus_per_model,
+                num_gpus_total=args.num_gpus_total,
+                temperature=args.temperature,
+                do_sample=do_sample,
+            )
+            reorg_answer_file(answer_file)

@@ -8,6 +8,9 @@ python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fa
 import json
 import os
 import time
+import traceback
+from datetime import datetime
+
 import torch
 import numpy as np
 import shortuuid
@@ -15,6 +18,26 @@ import shortuuid
 from fastchat.llm_judge.common import load_questions
 from fastchat.model import get_conversation_template
 from tqdm import tqdm
+
+ERROR_LOG_PATH = os.path.join("logs", "kangaroo_eval_errors.log")
+_LOGGED_GRAD_STATE = False
+
+
+def _log_forward_error(*, question_id: int, turn_idx: int, prompt: str, kwargs: dict, exc: BaseException) -> None:
+    """Persist rich debugging info for forward failures."""
+
+    os.makedirs(os.path.dirname(ERROR_LOG_PATH), exist_ok=True)
+    payload = {
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "question_id": question_id,
+        "turn_idx": turn_idx,
+        "kwargs": kwargs,
+        "prompt_preview": prompt[:2000],
+        "error": repr(exc),
+        "traceback": traceback.format_exc(),
+    }
+    with open(ERROR_LOG_PATH, "a") as fout:
+        fout.write(json.dumps(payload) + "\n")
 
 
 def run_eval(
@@ -68,7 +91,6 @@ def run_eval(
         ray.get(ans_handles)
 
 
-@torch.inference_mode()
 def get_model_answers(
         model,
         tokenizer,
@@ -80,12 +102,22 @@ def get_model_answers(
         num_choices,
         **kwargs,
 ):
+    global _LOGGED_GRAD_STATE
 
     model.eval()
     print('Check model training state:', model.training)
 
     cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
     print('CUDA VISIBLE DEVICES:', cuda_visible_devices)
+    dvi_online = bool(kwargs.get("dvi_online", False))
+    forward_kwargs = dict(kwargs)
+    forward_kwargs.pop("dvi_online", None)
+    if not _LOGGED_GRAD_STATE:
+        print(
+            f"[Eval][debug] torch.is_grad_enabled={torch.is_grad_enabled()} "
+            f"dvi_online={dvi_online}"
+        )
+        _LOGGED_GRAD_STATE = True
 
     question = questions[0]
 
@@ -106,13 +138,17 @@ def get_model_answers(
             input_ids = inputs.input_ids
             try:
                 torch.cuda.synchronize()
+                if dvi_online:
+                    print(
+                        f"[Eval][debug] grad_enabled before forward={torch.is_grad_enabled()}"
+                    )
                 start_time = time.time()
                 forward_result = forward_func(
                     inputs,
                     model,
                     tokenizer,
                     max_new_tokens,
-                    **kwargs,
+                    **forward_kwargs,
                 )
                 if len(forward_result) == 5:
                     (
@@ -158,6 +194,13 @@ def get_model_answers(
             except RuntimeError as e:
                 print("ERROR question ID: ", question["question_id"])
                 print("  RuntimeError:", repr(e))
+                _log_forward_error(
+                    question_id=question["question_id"],
+                    turn_idx=j,
+                    prompt=prompt,
+                    kwargs=forward_kwargs,
+                    exc=e,
+                )
                 output = "ERROR"
                 idx = -1
                 new_token = 0
@@ -200,7 +243,7 @@ def get_model_answers(
                         model,
                         tokenizer,
                         max_new_tokens,
-                        **kwargs,
+                        **forward_kwargs,
                     )
                     if len(forward_result) == 5:
                         (
@@ -246,6 +289,13 @@ def get_model_answers(
                 except RuntimeError as e:
                     print("ERROR question ID: ", question["question_id"])
                     print("  RuntimeError:", repr(e))
+                    _log_forward_error(
+                        question_id=question["question_id"],
+                        turn_idx=j,
+                        prompt=prompt,
+                        kwargs=forward_kwargs,
+                        exc=e,
+                    )
                     output = "ERROR"
                     idx = -1
                     new_token = 0

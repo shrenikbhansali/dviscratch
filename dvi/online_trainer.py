@@ -56,6 +56,11 @@ class OnlineTrainer:
         for param in self._trainable:
             if not param.requires_grad:
                 param.requires_grad_(True)
+        debug_stats = ", ".join(
+            f"{tuple(p.shape)}@{p.device}:{p.dtype}=grad{p.requires_grad}"
+            for p in self._trainable
+        )
+        print(f"[DVI][debug]init trainables -> {debug_stats}")
         self._debug_once = False
 
         if device is None:
@@ -106,6 +111,11 @@ class OnlineTrainer:
         with torch.enable_grad():
             draft_logits = self.model.drafter_logits_from_hk(hk)
             if not draft_logits.requires_grad:
+                dbg = ", ".join(
+                    f"{tuple(p.shape)}:requires_grad={p.requires_grad}"
+                    for p in self._trainable
+                )
+                print(f"[DVI][debug] draft_logits lacks grad_fn; trainables -> {dbg}")
                 raise RuntimeError(
                     "drafter logits are detached from autograd; ensure LoRA parameters remain trainable."
                 )

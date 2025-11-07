@@ -361,6 +361,7 @@ class KangarooModel(nn.Module):
         target_device = base_weight.device
         target_dtype = base_weight.dtype
         drafter = drafter.to(device=target_device, dtype=target_dtype)
+        drafter.proj.set_lora_dtype(torch.float32)
 
         drafter.proj.base.weight.data.copy_(base_weight.data)
         drafter.proj.base.weight.requires_grad_(False)
@@ -375,9 +376,13 @@ class KangarooModel(nn.Module):
             raise ValueError("drafter LoRA rank must be positive.")
         if getattr(self.drafter_head.proj, "alpha", 0.0) == 0.0:
             raise ValueError("drafter LoRA alpha must be non-zero.")
-        self._restore_drafter_gradients()
-        self._ensure_drafter_trainable()
+        self.set_drafter_trainable(True)
         self._validate_trainable_layout()
+        grad_stats = ", ".join(
+            f"{name}:requires_grad={param.requires_grad}"
+            for name, param in self.drafter_head.named_parameters()
+        )
+        print(f"[Kangaroo][debug] drafter params -> {grad_stats}")
 
     def drafter_logits_from_hk(self, hk: "torch.Tensor") -> "torch.Tensor":
         """Return drafter logits for hidden states ``hk``; requires ``attach_drafter_head`` first."""
@@ -407,16 +412,11 @@ class KangarooModel(nn.Module):
 
         if not hasattr(self, "drafter_head"):
             return []
-        return list(self.drafter_head.lora_params())
-
-    def _restore_drafter_gradients(self) -> None:
-        """Force LoRA parameters to remain trainable even after global freezing."""
-
-        if not hasattr(self, "drafter_head"):
-            return
-        for param in self.drafter_head.lora_params():
-            if param is not None and not param.requires_grad:
-                param.requires_grad_(True)
+        return [
+            param
+            for param in self.drafter_head.lora_params()
+            if param is not None and param.requires_grad
+        ]
 
     def _ensure_drafter_trainable(self) -> None:
         """Sanity-check that the drafter head exposes trainable LoRA params."""
@@ -446,3 +446,28 @@ class KangarooModel(nn.Module):
                 "Non-LoRA parameters remain trainable after initialization: "
                 + ", ".join(offending)
             )
+
+    def set_drafter_trainable(self, enabled: bool) -> None:
+        """Toggle LoRA drafter parameters between frozen and trainable states."""
+
+        if not hasattr(self, "drafter_head"):
+            return
+
+        params = [p for p in self.drafter_head.lora_params() if p is not None]
+        if enabled:
+            for param in params:
+                param.requires_grad_(True)
+            self._ensure_drafter_trainable()
+        else:
+            for param in params:
+                param.requires_grad_(False)
+                if param.grad is not None:
+                    param.grad = None
+
+        self._validate_trainable_layout()
+
+        state = ", ".join(
+            f"{name}:requires_grad={param.requires_grad}"
+            for name, param in self.drafter_head.named_parameters()
+        )
+        print(f"[Kangaroo][debug] set_drafter_trainable({enabled}) -> {state}")

@@ -76,6 +76,12 @@ def add_dvi_args(parser: argparse.ArgumentParser) -> None:
         default=False,
         help="Print shallow hk capture statistics for each draft block.",
     )
+    parser.add_argument(
+        "--dvi-debug-blocks",
+        type=str2bool,
+        default=False,
+        help="Print per-block speculative acceptance stats.",
+    )
 
 
 def normalize_model_flags(args: argparse.Namespace) -> str:

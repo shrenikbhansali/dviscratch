@@ -43,8 +43,11 @@ class LoRALinear(nn.Module):
         if self.rank <= 0 or self.alpha == 0.0:
             return result
 
-        lora_update = F.linear(x, self.B)
+        target_dtype = self.A.dtype if self.A is not None else result.dtype
+        lora_input = x.to(dtype=target_dtype)
+        lora_update = F.linear(lora_input, self.B)
         lora_update = F.linear(lora_update, self.A)
+        lora_update = lora_update.to(dtype=result.dtype)
         return result + self.scaling * lora_update
 
     def trainable_params(self) -> List[nn.Parameter]:
@@ -53,6 +56,14 @@ class LoRALinear(nn.Module):
         if self.rank <= 0 or self.alpha == 0.0:
             return []
         return [self.A, self.B]
+
+    def set_lora_dtype(self, dtype: torch.dtype) -> None:
+        """Cast LoRA parameters to ``dtype`` without touching the frozen base."""
+
+        if self.rank <= 0 or self.A is None or self.B is None:
+            return
+        self.A = nn.Parameter(self.A.to(dtype=dtype))
+        self.B = nn.Parameter(self.B.to(dtype=dtype))
 
 
 class DrafterHead(nn.Module):
