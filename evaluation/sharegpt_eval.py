@@ -6,7 +6,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -110,6 +110,8 @@ def stream_sharegpt_answers(
     forward_kwargs: Optional[Dict[str, Any]] = None,
     block_dump_path: Optional[str] = None,
     block_dump_max_tokens: int = 32,
+    sample_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """Run *forward_func* over ShareGPT samples and persist per-sample metrics.
 
@@ -135,6 +137,14 @@ def stream_sharegpt_answers(
 
     with open(output_path, "w", encoding="utf-8") as fout:
         for sample_idx, prompt, reference in sample_iter:
+            if sample_callback:
+                sample_callback(
+                    {
+                        "sample_idx": sample_idx,
+                        "prompt": prompt,
+                        "reference": reference,
+                    }
+                )
             inputs = tokenizer([prompt], return_tensors="pt")
             inputs = inputs.to(device)
             input_len = inputs.input_ids.shape[1]
@@ -230,6 +240,16 @@ def stream_sharegpt_answers(
             processed += 1
             total_wall += total_time
             total_tokens += int(new_token)
+
+            if progress_callback and processed:
+                progress_callback(
+                    {
+                        "processed": processed,
+                        "avg_wall_time": total_wall / processed,
+                        "tokens_per_second": (total_tokens / total_wall) if total_wall > 0 else 0.0,
+                        "errored": errored,
+                    }
+                )
 
             if processed % 10 == 0:
                 tps = total_tokens / total_wall if total_wall > 0 else 0.0

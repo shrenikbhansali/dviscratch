@@ -4,3 +4,4 @@ accelerate==0.21.0
 fschat==0.2.34
 openai==0.28.0
 sentencepiece==0.1.99
+wandb==0.16.6

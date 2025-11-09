@@ -12,6 +12,11 @@ if __package__ is None or __package__ == "":
 import torch
 from transformers import AutoTokenizer
 
+try:
+    import wandb
+except ImportError:  # pragma: no cover - optional dependency
+    wandb = None
+
 from kangaroo.cli_utils import (
     add_dvi_args,
     add_model_and_adapter_args,
@@ -29,6 +34,8 @@ global_step = 0
 blocks_processed = 0
 tokens_accepted_total = 0
 COUNTER_LOG_FREQUENCY = 50
+WANDB_PROJECT_DEFAULT = "sbhansali8-georgia-institute-of-technology/dviscratch"
+WANDB_API_KEY_FALLBACK = "78575c71e3200c01b61cae0272aef2d952ca18f9"
 
 
 def _make_default_dvi_runtime() -> Dict[str, Any]:
@@ -41,10 +48,102 @@ def _make_default_dvi_runtime() -> Dict[str, Any]:
         "update_every": 1,
         "logits_dtype": torch.float16,
         "max_ms": 0.0,
+        "current_sample_idx": None,
     }
 
 
 DVI_RUNTIME: Dict[str, Any] = _make_default_dvi_runtime()
+WANDB_RUN = None
+
+
+def _maybe_init_wandb(args: argparse.Namespace) -> None:
+    """Initialize Weights & Biases if a project is provided."""
+
+    global WANDB_RUN
+
+    if WANDB_RUN is not None or not getattr(args, "wandb_project", None):
+        return
+
+    if wandb is None:
+        raise RuntimeError(
+            "wandb is not installed; install wandb or omit --wandb-project to disable logging."
+        )
+
+    if WANDB_API_KEY_FALLBACK and "WANDB_API_KEY" not in os.environ:
+        os.environ["WANDB_API_KEY"] = WANDB_API_KEY_FALLBACK
+
+    project_arg = args.wandb_project
+    entity = getattr(args, "wandb_entity", None)
+    project = project_arg
+    if project and "/" in project:
+        maybe_entity, maybe_project = project.split("/", 1)
+        if maybe_project:
+            project = maybe_project
+            if not entity:
+                entity = maybe_entity
+
+    wandb_kwargs: Dict[str, Any] = {
+        "project": project,
+        "name": args.wandb_run_name,
+        "entity": entity,
+        "config": {
+            "model_id": args.model_id,
+            "exitlayer": args.exitlayer,
+            "steps": args.steps,
+            "threshold": args.threshold,
+            "dvi_online": args.dvi_online,
+            "dvi_batch_size": args.dvi_batch_size,
+            "dvi_update_every": args.dvi_update_every,
+            "dvi_buffer_size": args.dvi_buffer_size,
+            "wandb_project_path": project_arg,
+        },
+    }
+
+    if args.wandb_mode:
+        wandb_kwargs["mode"] = args.wandb_mode
+
+    tags = getattr(args, "wandb_tags", None)
+    if tags:
+        wandb_kwargs["tags"] = tags
+
+    wandb_kwargs = {k: v for k, v in wandb_kwargs.items() if v is not None}
+    WANDB_RUN = wandb.init(**wandb_kwargs)
+
+
+def _wandb_log(payload: Dict[str, Any], step: Optional[int] = None) -> None:
+    if WANDB_RUN is None or wandb is None or not payload:
+        return
+    wandb.log(payload, step=step)
+
+
+def _finish_wandb() -> None:
+    global WANDB_RUN
+    if WANDB_RUN is not None and wandb is not None:
+        wandb.finish()
+    WANDB_RUN = None
+
+
+def _on_sharegpt_sample(sample: Dict[str, Any]) -> None:
+    runtime = DVI_RUNTIME
+    runtime["current_sample_idx"] = sample.get("sample_idx")
+    _wandb_log(
+        {
+            "sharegpt/sample_idx": sample.get("sample_idx"),
+        },
+        step=sample.get("sample_idx"),
+    )
+
+
+def _on_sharegpt_progress(stats: Dict[str, Any]) -> None:
+    _wandb_log(
+        {
+            "sharegpt/processed": stats.get("processed"),
+            "sharegpt/avg_wall_time": stats.get("avg_wall_time"),
+            "sharegpt/tokens_per_second": stats.get("tokens_per_second"),
+            "sharegpt/errored": stats.get("errored"),
+        },
+        step=stats.get("processed"),
+    )
 
 
 def record_block_result(tokens_accepted: int) -> None:
@@ -139,6 +238,7 @@ def configure_dvi_runtime(args: argparse.Namespace, model: KangarooModel, device
         "update_every": int(args.dvi_update_every),
         "logits_dtype": logits_dtype,
         "max_ms": float(args.max_online_train_ms),
+        "current_sample_idx": None,
     }
 
 
@@ -173,6 +273,7 @@ def _dvi_process_block(
     logits: torch.Tensor,
     accepted_tokens: int,
     eos_token_id: Optional[int],
+    verifier_tokens: List[int],
 ) -> None:
     """Push accepted/reject tuples for the current speculative block."""
 
@@ -208,10 +309,17 @@ def _dvi_process_block(
 
     store_mode = runtime.get("store_mode", "topk")
 
+    # Guard against missing verifier tokens.
+    if not verifier_tokens:
+        return
+
     # Push accepted tuples.
     for pos in range(1, accepted_tokens + 1):
         hk_state = draft_trace.hk_state_of(pos)
-        token_id = int(draft_trace.tokens[pos - 1])
+        if pos - 1 < len(verifier_tokens):
+            token_id = int(verifier_tokens[pos - 1])
+        else:
+            token_id = int(draft_trace.tokens[pos - 1])
         z_phi = logits_block[pos - 1]
         if store_mode == "full":
             buffer.push_full(
@@ -233,10 +341,13 @@ def _dvi_process_block(
             )
 
     # Push first reject if applicable.
-    if accepted_tokens < k and not eos_accepted:
+    if accepted_tokens < k and not eos_accepted and verifier_tokens:
         reject_pos = accepted_tokens + 1
         hk_state = draft_trace.hk_state_of(reject_pos)
-        token_id = int(draft_trace.tokens[reject_pos - 1])
+        if reject_pos - 1 < len(verifier_tokens):
+            token_id = int(verifier_tokens[reject_pos - 1])
+        else:
+            token_id = int(draft_trace.tokens[reject_pos - 1])
         z_phi = logits_block[reject_pos - 1]
         if store_mode == "full":
             buffer.push_full(
@@ -284,13 +395,33 @@ def _dvi_maybe_step() -> None:
     batch = buffer.sample(batch_size)
     stats = trainer.step(batch, global_step)
     fill_ratio = buffer.size / buffer.capacity
+    sample_idx = runtime.get("current_sample_idx")
+    sample_suffix = ""
+    if sample_idx is not None:
+        sample_suffix += f" sample={sample_idx}"
     print(
         "[DVI] step="
         f"{global_step} loss={stats['loss']:.3f} kd={stats['kd']:.3f} "
         f"ce={stats['ce']:.3f} pg={stats['pg']:.3f} kl={stats['kl']:.3f} "
         f"ms={stats['ms']:.2f} acc_ratio={stats['acc_ratio']:.3f} "
-        f"buf={buffer.size}/{buffer.capacity} fill={fill_ratio:.2f}"
+        f"buf={buffer.size}/{buffer.capacity} fill={fill_ratio:.2f}{sample_suffix}"
     )
+    log_payload = {
+        "dvi/step": global_step,
+        "dvi/loss": stats["loss"],
+        "dvi/kd": stats["kd"],
+        "dvi/ce": stats["ce"],
+        "dvi/pg": stats["pg"],
+        "dvi/kl": stats["kl"],
+        "dvi/ms": stats["ms"],
+        "dvi/acc_ratio": stats["acc_ratio"],
+        "dvi/buf": buffer.size,
+        "dvi/buf_capacity": buffer.capacity,
+        "dvi/fill": fill_ratio,
+    }
+    if sample_idx is not None:
+        log_payload["dvi/sample_idx"] = sample_idx
+    _wandb_log(log_payload, step=global_step)
     if stats["ms"] > runtime.get("max_ms", 0.0):
         print(
             "[DVI][warn] trainer step "
@@ -538,6 +669,7 @@ def kangaroo_forward(
                     logits=logits,
                     accepted_tokens=accepted_tokens,
                     eos_token_id=token_eos,
+                    verifier_tokens=verifier_block_tokens,
                 )
             record_block_result(accepted_tokens)
             accept_length_list.append(accepted_tokens)
@@ -718,6 +850,38 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Path to save ShareGPT streaming results (defaults under data/sharegpt_runs).",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default=WANDB_PROJECT_DEFAULT,
+        help="If provided, enable Weights & Biases logging under this project.",
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="Optional Weights & Biases run name.",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help="Optional Weights & Biases entity/org.",
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        default=None,
+        choices=["online", "offline", "disabled"],
+        help="Override wandb init mode.",
+    )
+    parser.add_argument(
+        "--wandb-tags",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Optional tags to attach to the Weights & Biases run.",
     )
     return parser
 
@@ -909,98 +1073,112 @@ if __name__ == "__main__":
     from evaluation.eval import reorg_answer_file, run_eval
 
     args = parse_args()
+    _maybe_init_wandb(args)
+    try:
+        question_file = "data/question.jsonl"
 
-    question_file = "data/question.jsonl"
-
-    model = KangarooModel(
-        model_id=args.model_id,
-        adapter_mode=args.adapter_mode,
-        adapter_path=args.adapter_path,
-        exit_layer=args.exitlayer,
-        dtype=args.dtype,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-    do_sample = False
-
-    if args.dvi_attach_drafter or args.dvi_online or bool(args.load_lora):
-        model.attach_drafter_head(r=args.dvi_lora_rank, alpha=args.dvi_lora_alpha)
-
-    if args.dvi_online:
-        try:
-            ref_param = next(model.head_model.parameters())
-        except StopIteration as exc:
-            raise RuntimeError(
-                "model.head_model exposes no parameters for device inference"
-            ) from exc
-        dvi_device = ref_param.device
-    else:
-        dvi_device = torch.device("cpu")
-    configure_dvi_runtime(args, model, dvi_device)
-    grad_names = [name for name, param in model.named_parameters() if param.requires_grad]
-    print(f"[Kangaroo][debug] parameters requiring grad: {grad_names}")
-
-    if args.sharegpt_jsonl:
-        safe_model = args.model_id.replace("/", "_")
-        default_out = os.path.join("data", "sharegpt_runs", f"{safe_model}_kangaroo.jsonl")
-        sharegpt_output = args.sharegpt_output or default_out
-        cfg = ShareGPTConfig(
-            path=args.sharegpt_jsonl,
-            max_samples=args.sharegpt_max_samples,
-            skip_samples=args.sharegpt_skip_samples,
-            max_src_len=args.sharegpt_max_src_len,
-            max_tgt_len=args.sharegpt_max_tgt_len,
-            keep_system=args.sharegpt_keep_system,
-            use_last_turn=args.sharegpt_use_last_turn,
+        model = KangarooModel(
+            model_id=args.model_id,
+            adapter_mode=args.adapter_mode,
+            adapter_path=args.adapter_path,
+            exit_layer=args.exitlayer,
+            dtype=args.dtype,
         )
-        stats = stream_sharegpt_answers(
-            model=model,
-            tokenizer=tokenizer,
-            forward_func=kangaroo_forward,
-            output_path=sharegpt_output,
-            max_new_tokens=args.max_new_tokens,
-            sharegpt_cfg=cfg,
-            forward_kwargs={
-                "threshold": args.threshold,
-                "SPECULATIVE_DECODING_STEPS": args.steps,
-                "EARLY_STOP_LAYER": args.exitlayer,
-                "dvi_debug_hk": args.dvi_debug_hk,
-                "dvi_debug_blocks": args.dvi_debug_blocks,
-            },
-            block_dump_path=args.sharegpt_block_dump,
-            block_dump_max_tokens=args.sharegpt_block_dump_max_tokens,
-        )
-        print(
-            f"[ShareGPT] completed {stats['processed']} samples "
-            f"(tokens/sec={stats['tokens_per_second']:.2f}, avg_wall={stats['avg_wall_time']:.2f}s)"
-        )
-    else:
-        assert not args.answer_file
-        os.makedirs(f"data/{args.bench_name}/{args.model_id}", exist_ok=True)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+        do_sample = False
 
-        for run in range(3):
-            answer_file = f"data/{args.bench_name}/{args.model_id}/{run}.jsonl"
-            print(f"Output to {answer_file}")
+        if args.dvi_attach_drafter or args.dvi_online or bool(args.load_lora):
+            model.attach_drafter_head(r=args.dvi_lora_rank, alpha=args.dvi_lora_alpha)
 
-            run_eval(
+        if args.dvi_online:
+            try:
+                ref_param = next(model.head_model.parameters())
+            except StopIteration as exc:
+                raise RuntimeError(
+                    "model.head_model exposes no parameters for device inference"
+                ) from exc
+            dvi_device = ref_param.device
+        else:
+            dvi_device = torch.device("cpu")
+        configure_dvi_runtime(args, model, dvi_device)
+        grad_names = [name for name, param in model.named_parameters() if param.requires_grad]
+        print(f"[Kangaroo][debug] parameters requiring grad: {grad_names}")
+
+        if args.sharegpt_jsonl:
+            safe_model = args.model_id.replace("/", "_")
+            default_out = os.path.join("data", "sharegpt_runs", f"{safe_model}_kangaroo.jsonl")
+            sharegpt_output = args.sharegpt_output or default_out
+            cfg = ShareGPTConfig(
+                path=args.sharegpt_jsonl,
+                max_samples=args.sharegpt_max_samples,
+                skip_samples=args.sharegpt_skip_samples,
+                max_src_len=args.sharegpt_max_src_len,
+                max_tgt_len=args.sharegpt_max_tgt_len,
+                keep_system=args.sharegpt_keep_system,
+                use_last_turn=args.sharegpt_use_last_turn,
+            )
+            stats = stream_sharegpt_answers(
                 model=model,
                 tokenizer=tokenizer,
                 forward_func=kangaroo_forward,
-                model_id=args.model_id,
-                question_file=question_file,
-                question_begin=args.question_begin,
-                question_end=args.question_end,
-                answer_file=answer_file,
+                output_path=sharegpt_output,
                 max_new_tokens=args.max_new_tokens,
-                num_choices=args.num_choices,
-                num_gpus_per_model=args.num_gpus_per_model,
-                num_gpus_total=args.num_gpus_total,
-                do_sample=do_sample,
-                threshold=args.threshold,
-                SPECULATIVE_DECODING_STEPS=args.steps,
-                EARLY_STOP_LAYER=args.exitlayer,
-                dvi_debug_hk=args.dvi_debug_hk,
-                dvi_debug_blocks=args.dvi_debug_blocks,
-                dvi_online=args.dvi_online,
+                sharegpt_cfg=cfg,
+                forward_kwargs={
+                    "threshold": args.threshold,
+                    "SPECULATIVE_DECODING_STEPS": args.steps,
+                    "EARLY_STOP_LAYER": args.exitlayer,
+                    "dvi_debug_hk": args.dvi_debug_hk,
+                    "dvi_debug_blocks": args.dvi_debug_blocks,
+                },
+                block_dump_path=args.sharegpt_block_dump,
+                block_dump_max_tokens=args.sharegpt_block_dump_max_tokens,
+                sample_callback=_on_sharegpt_sample,
+                progress_callback=_on_sharegpt_progress,
             )
+            print(
+                f"[ShareGPT] completed {stats['processed']} samples "
+                f"(tokens/sec={stats['tokens_per_second']:.2f}, avg_wall={stats['avg_wall_time']:.2f}s)"
+            )
+            _wandb_log(
+                {
+                    "sharegpt/final_processed": stats.get("processed"),
+                    "sharegpt/final_avg_wall_time": stats.get("avg_wall_time"),
+                    "sharegpt/final_tokens_per_second": stats.get("tokens_per_second"),
+                    "sharegpt/final_total_tokens": stats.get("total_tokens"),
+                    "sharegpt/final_errored": stats.get("errored"),
+                }
+            )
+        else:
+            assert not args.answer_file
+            os.makedirs(f"data/{args.bench_name}/{args.model_id}", exist_ok=True)
 
-            reorg_answer_file(answer_file)
+            for run in range(3):
+                answer_file = f"data/{args.bench_name}/{args.model_id}/{run}.jsonl"
+                print(f"Output to {answer_file}")
+
+                run_eval(
+                    model=model,
+                    tokenizer=tokenizer,
+                    forward_func=kangaroo_forward,
+                    model_id=args.model_id,
+                    question_file=question_file,
+                    question_begin=args.question_begin,
+                    question_end=args.question_end,
+                    answer_file=answer_file,
+                    max_new_tokens=args.max_new_tokens,
+                    num_choices=args.num_choices,
+                    num_gpus_per_model=args.num_gpus_per_model,
+                    num_gpus_total=args.num_gpus_total,
+                    do_sample=do_sample,
+                    threshold=args.threshold,
+                    SPECULATIVE_DECODING_STEPS=args.steps,
+                    EARLY_STOP_LAYER=args.exitlayer,
+                    dvi_debug_hk=args.dvi_debug_hk,
+                    dvi_debug_blocks=args.dvi_debug_blocks,
+                    dvi_online=args.dvi_online,
+                )
+
+                reorg_answer_file(answer_file)
+    finally:
+        _finish_wandb()
