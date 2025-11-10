@@ -316,10 +316,7 @@ def _dvi_process_block(
     # Push accepted tuples.
     for pos in range(1, accepted_tokens + 1):
         hk_state = draft_trace.hk_state_of(pos)
-        if pos - 1 < len(verifier_tokens):
-            token_id = int(verifier_tokens[pos - 1])
-        else:
-            token_id = int(draft_trace.tokens[pos - 1])
+        token_id = int(draft_trace.tokens[pos - 1])
         z_phi = logits_block[pos - 1]
         if store_mode == "full":
             buffer.push_full(
@@ -344,10 +341,7 @@ def _dvi_process_block(
     if accepted_tokens < k and not eos_accepted and verifier_tokens:
         reject_pos = accepted_tokens + 1
         hk_state = draft_trace.hk_state_of(reject_pos)
-        if reject_pos - 1 < len(verifier_tokens):
-            token_id = int(verifier_tokens[reject_pos - 1])
-        else:
-            token_id = int(draft_trace.tokens[reject_pos - 1])
+        token_id = int(draft_trace.tokens[reject_pos - 1])
         z_phi = logits_block[reject_pos - 1]
         if store_mode == "full":
             buffer.push_full(

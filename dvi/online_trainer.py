@@ -148,7 +148,8 @@ class OnlineTrainer:
             mask_pg = mask_acc | is_first_reject
 
             ce = mean_over_mask(nll, mask_acc)
-            pg_term = -nll * (reward - self.ema_b) * mask_pg.float()
+            # REINFORCE: gradient should increase log-prob of rewarded actions.
+            pg_term = nll * (reward - self.ema_b) * mask_pg.float()
             pg = mean_over_mask(pg_term, mask_pg)
 
             w = self.schedule.weights()
