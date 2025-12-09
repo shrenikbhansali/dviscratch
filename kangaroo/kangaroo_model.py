@@ -21,6 +21,7 @@ from kangaroo.adapter import (
     _make_causal_mask,
 )
 from kangaroo.earlyexit import EarlyExitLlamaForCausalLM
+from kangaroo.drafter_bridge import DrafterBridge
 from kangaroo.drafter_head import DrafterHead
 
 
@@ -75,6 +76,7 @@ class IdentityAdapterModel(nn.Module):
 
     def __init__(self, config: LlamaConfig) -> None:
         super().__init__()
+        self.pass_through = getattr(config, "is_identity_adapter", False)
         self.gradient_checkpointing = False
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -145,6 +147,12 @@ class IdentityAdapterModel(nn.Module):
         return_dict: Optional[bool] = None,
         std=None,
     ):
+        if self.pass_through:
+            if use_cache:
+                cache = past_key_values if past_key_values is not None else tuple()
+                return inputs_embeds, cache
+            return inputs_embeds
+
         if inputs_embeds is None:
             raise ValueError("IdentityAdapterModel expects inputs_embeds")
 
@@ -241,6 +249,7 @@ class KangarooModel(nn.Module):
 
         self.head_model = self._resolve_head_model()
         self._freeze_module(self.head_model)
+        self.bridge: Optional[DrafterBridge] = None
 
         self.config = self.base_model.config
         normalized_path = adapter_path
@@ -342,7 +351,15 @@ class KangarooModel(nn.Module):
     def forward(self):
         raise NotImplementedError
 
-    def attach_drafter_head(self, *, r: int, alpha: float) -> None:
+    def attach_drafter_head(
+        self,
+        *,
+        r: int,
+        alpha: float,
+        bridge: bool = False,
+        bridge_kind: str = "ffn",
+        bridge_heads: int = 8,
+    ) -> None:
         """Attach a drafter head cloned from ``self.head_model`` with frozen base weights."""
 
         if hasattr(self, "drafter_head"):
@@ -372,6 +389,13 @@ class KangarooModel(nn.Module):
             drafter.proj.base.bias.requires_grad_(False)
 
         self.drafter_head = drafter
+        if bridge:
+            self.bridge = DrafterBridge(
+                hidden_size,
+                kind=bridge_kind,
+                n_heads=bridge_heads,
+            )
+            self.bridge = self.bridge.to(device=target_device)
         if getattr(self.drafter_head.proj, "rank", 0) <= 0:
             raise ValueError("drafter LoRA rank must be positive.")
         if getattr(self.drafter_head.proj, "alpha", 0.0) == 0.0:
@@ -405,18 +429,26 @@ class KangarooModel(nn.Module):
                 f"expected device={drafter_weight.device}, dtype={drafter_weight.dtype}"
             )
 
-        return self.drafter_head(hk)
+        x = hk
+        if self.bridge is not None:
+            x = self.bridge(x)
+        return self.drafter_head(x)
 
     def dvi_trainable_params(self) -> "List[nn.Parameter]":
         """Return the LoRA trainable parameters of the drafter head, if present."""
 
-        if not hasattr(self, "drafter_head"):
-            return []
-        return [
-            param
-            for param in self.drafter_head.lora_params()
-            if param is not None and param.requires_grad
-        ]
+        params: List[nn.Parameter] = []
+        if hasattr(self, "drafter_head"):
+            params.extend(
+                [
+                    param
+                    for param in self.drafter_head.lora_params()
+                    if param is not None and param.requires_grad
+                ]
+            )
+        if self.bridge is not None:
+            params.extend([p for p in self.bridge.parameters() if p.requires_grad])
+        return params
 
     def _ensure_drafter_trainable(self) -> None:
         """Sanity-check that the drafter head exposes trainable LoRA params."""
@@ -471,3 +503,18 @@ class KangarooModel(nn.Module):
             for name, param in self.drafter_head.named_parameters()
         )
         print(f"[Kangaroo][debug] set_drafter_trainable({enabled}) -> {state}")
+
+    def set_bridge_trainable(self, enabled: bool) -> None:
+        """Toggle bridge parameters between frozen and trainable states."""
+
+        if self.bridge is None:
+            return
+        for param in self.bridge.parameters():
+            param.requires_grad_(enabled)
+            if not enabled and param.grad is not None:
+                param.grad = None
+        state = ", ".join(
+            f"{name}:requires_grad={param.requires_grad}"
+            for name, param in self.bridge.named_parameters()
+        )
+        print(f"[Kangaroo][debug] set_bridge_trainable({enabled}) -> {state}")

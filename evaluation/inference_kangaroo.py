@@ -43,12 +43,17 @@ def _make_default_dvi_runtime() -> Dict[str, Any]:
         "enabled": False,
         "buffer": None,
         "trainer": None,
-        "store_mode": "topk",
+        "buffer_store_mode": "topk",
+        "target_store_mode": "topk",
+        "store_warmup_steps": 0,
         "batch_size": 0,
         "update_every": 1,
         "logits_dtype": torch.float16,
         "max_ms": 0.0,
         "current_sample_idx": None,
+        "model": None,
+        "device": None,
+        "args_snapshot": None,
     }
 
 
@@ -167,7 +172,9 @@ def reset_counters() -> None:
     tokens_accepted_total = 0
 
 
-def configure_dvi_runtime(args: argparse.Namespace, model: KangarooModel, device: torch.device) -> None:
+def configure_dvi_runtime(
+    args: argparse.Namespace, model: KangarooModel, device: torch.device, tokenizer: Optional[Any] = None
+) -> None:
     """Initialize (or disable) the DVI runtime structures based on *args*."""
 
     global DVI_RUNTIME
@@ -175,6 +182,8 @@ def configure_dvi_runtime(args: argparse.Namespace, model: KangarooModel, device
     if not getattr(args, "dvi_online", False):
         if hasattr(model, "set_drafter_trainable"):
             model.set_drafter_trainable(False)
+        if hasattr(model, "set_bridge_trainable"):
+            model.set_bridge_trainable(False)
         DVI_RUNTIME = _make_default_dvi_runtime()
         return
 
@@ -187,6 +196,9 @@ def configure_dvi_runtime(args: argparse.Namespace, model: KangarooModel, device
     if args.dvi_update_every <= 0:
         raise ValueError("--dvi-update-every must be positive when DVI is enabled")
 
+    if args.dvi_autograd_anomaly:
+        torch.autograd.set_detect_anomaly(True)
+
     logits_dtype = torch.float16 if args.dvi_logits_dtype == "float16" else torch.float32
 
     if hasattr(model, "set_drafter_trainable"):
@@ -196,12 +208,22 @@ def configure_dvi_runtime(args: argparse.Namespace, model: KangarooModel, device
             for param in model.dvi_trainable_params()
         ]
         print(f"[DVI][debug] enabling online mode with trainables={trainable_shapes}")
+    if hasattr(model, "set_bridge_trainable"):
+        model.set_bridge_trainable(bool(args.dvi_bridge_trainable))
+
+    buffer_store_mode = args.dvi_store
+    if args.dvi_store == "topk" and args.dvi_store_warmup_steps > 0:
+        buffer_store_mode = "full"
+        print(
+            "[DVI][info] store warmup enabled -> using full logits buffer; trainer will switch to top-k after "
+            f"{args.dvi_store_warmup_steps} steps."
+        )
 
     buffer = DVIRingBuffer(
         capacity=args.dvi_buffer_size,
         d_model=model.config.hidden_size,
         vocab_size=model.config.vocab_size,
-        store=args.dvi_store,
+        store=buffer_store_mode,
         topk=args.dvi_topk,
         logits_dtype=logits_dtype,
         device=str(device),
@@ -216,11 +238,13 @@ def configure_dvi_runtime(args: argparse.Namespace, model: KangarooModel, device
 
     trainer = OnlineTrainer(
         model,
-        lr=5e-5,
+        lr=args.dvi_lr,
         tau=args.dvi_tau,
         schedule=schedule,
         max_ms=args.max_online_train_ms,
-        store_mode=args.dvi_store,
+        store_mode=buffer_store_mode,
+        desired_store_mode=args.dvi_store,
+        store_warmup_steps=max(0, args.dvi_store_warmup_steps),
         topk=args.dvi_topk,
         vocab_size=model.config.vocab_size,
         weight_decay=0.01,
@@ -229,16 +253,33 @@ def configure_dvi_runtime(args: argparse.Namespace, model: KangarooModel, device
         device=device,
     )
 
+    if args.assert_drafter_equal:
+        ref_tokenizer = tokenizer or AutoTokenizer.from_pretrained(args.model_id)
+        _assert_drafter_equal(model, tokenizer=ref_tokenizer)
+
     DVI_RUNTIME = {
         "enabled": True,
         "buffer": buffer,
         "trainer": trainer,
-        "store_mode": args.dvi_store,
+        "buffer_store_mode": buffer_store_mode,
+        "target_store_mode": args.dvi_store,
+        "store_warmup_steps": max(0, args.dvi_store_warmup_steps),
         "batch_size": int(args.dvi_batch_size),
         "update_every": int(args.dvi_update_every),
         "logits_dtype": logits_dtype,
         "max_ms": float(args.max_online_train_ms),
         "current_sample_idx": None,
+        "model": model,
+        "device": device,
+        "args_snapshot": {
+            "buffer_size": args.dvi_buffer_size,
+            "topk": args.dvi_topk,
+            "tau": args.dvi_tau,
+            "weight_decay": 0.01,
+            "grad_clip": 1.0,
+            "ema_m": 0.01,
+            "lr": args.dvi_lr,
+        },
     }
 
 
@@ -307,7 +348,7 @@ def _dvi_process_block(
         and draft_trace.tokens[accepted_tokens - 1] == eos_token_id
     )
 
-    store_mode = runtime.get("store_mode", "topk")
+    store_mode = runtime.get("buffer_store_mode", "topk")
 
     # Guard against missing verifier tokens.
     if not verifier_tokens:
@@ -315,6 +356,8 @@ def _dvi_process_block(
 
     # Push accepted tuples.
     for pos in range(1, accepted_tokens + 1):
+        if not (1 <= pos <= k):
+            raise ValueError(f"accepted token position {pos} out of range for draft length {k}")
         hk_state = draft_trace.hk_state_of(pos)
         token_id = int(draft_trace.tokens[pos - 1])
         z_phi = logits_block[pos - 1]
@@ -340,6 +383,8 @@ def _dvi_process_block(
     # Push first reject if applicable.
     if accepted_tokens < k and not eos_accepted and verifier_tokens:
         reject_pos = accepted_tokens + 1
+        if not (1 <= reject_pos <= k):
+            raise ValueError(f"reject position {reject_pos} out of range for draft length {k}")
         hk_state = draft_trace.hk_state_of(reject_pos)
         token_id = int(draft_trace.tokens[reject_pos - 1])
         z_phi = logits_block[reject_pos - 1]
@@ -397,8 +442,13 @@ def _dvi_maybe_step() -> None:
         "[DVI] step="
         f"{global_step} loss={stats['loss']:.3f} kd={stats['kd']:.3f} "
         f"ce={stats['ce']:.3f} pg={stats['pg']:.3f} kl={stats['kl']:.3f} "
-        f"ms={stats['ms']:.2f} acc_ratio={stats['acc_ratio']:.3f} "
-        f"buf={buffer.size}/{buffer.capacity} fill={fill_ratio:.2f}{sample_suffix}"
+        f"ms={stats['ms']:.2f} over={stats['over_budget_ms']:.2f} "
+        f"acc_ratio={stats['acc_ratio']:.3f} agree={stats['argmax_agree']:.3f} "
+        f"grad={stats['grad_norm']:.3e} pre_grad={stats['grad_norm_pre']:.3e} "
+        f"grad_params={int(stats['grad_params'])} topk_hit={stats['teacher_topk_hit']:.3f} "
+        f"buf={buffer.size}/{buffer.capacity} fill={fill_ratio:.2f} "
+        f"w=({stats['w_kd']:.2f},{stats['w_ce']:.2f},{stats['w_pg']:.2f},{stats['w_kl']:.2f})"
+        f"{sample_suffix}"
     )
     log_payload = {
         "dvi/step": global_step,
@@ -409,6 +459,17 @@ def _dvi_maybe_step() -> None:
         "dvi/kl": stats["kl"],
         "dvi/ms": stats["ms"],
         "dvi/acc_ratio": stats["acc_ratio"],
+        "dvi/argmax_agree": stats["argmax_agree"],
+        "dvi/grad_norm": stats["grad_norm"],
+        "dvi/grad_norm_pre": stats["grad_norm_pre"],
+        "dvi/grad_params": stats["grad_params"],
+        "dvi/lr": stats["lr"],
+        "dvi/over_budget_ms": stats["over_budget_ms"],
+        "dvi/teacher_topk_hit": stats["teacher_topk_hit"],
+        "dvi/w_kd": stats["w_kd"],
+        "dvi/w_ce": stats["w_ce"],
+        "dvi/w_pg": stats["w_pg"],
+        "dvi/w_kl": stats["w_kl"],
         "dvi/buf": buffer.size,
         "dvi/buf_capacity": buffer.capacity,
         "dvi/fill": fill_ratio,
@@ -421,6 +482,137 @@ def _dvi_maybe_step() -> None:
             "[DVI][warn] trainer step "
             f"{stats['ms']:.2f}ms > budget {runtime.get('max_ms', 0.0):.2f}ms"
         )
+
+
+def _run_verifier_tail(model: KangarooModel, hidden_states: torch.Tensor, attention_mask: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+    """Run the verifier tail (layers >= exit_layer) starting from ``hidden_states``."""
+
+    llama = model.base_model.model
+    batch, seq, _ = hidden_states.shape
+    attn_mask = llama._prepare_decoder_attention_mask(
+        attention_mask,
+        (batch, seq),
+        hidden_states,
+        past_key_values_length=0,
+    )
+    x = hidden_states
+    for layer in llama.layers[model.exit_layer :]:
+        outputs = layer(
+            x,
+            attention_mask=attn_mask,
+            position_ids=position_ids,
+            past_key_value=None,
+            output_attentions=False,
+            use_cache=False,
+        )
+        x = outputs[0]
+    x = llama.norm(x)
+    return model.head_model(x)
+
+
+def _assert_lossless_identity(model: KangarooModel, tokenizer) -> None:
+    """Assert that the identity adapter path matches the base verifier path."""
+
+    if not getattr(model, "adapter_cfg", None):
+        return
+    if not getattr(model.adapter_cfg, "is_identity_adapter", False):
+        print("[DVI] --assert-lossless skipped (adapter is not identity).")
+        return
+
+    device = next(model.head_model.parameters()).device
+    sample = tokenizer("Lossless identity adapter check.", return_tensors="pt")
+    sample = {k: v.to(device) for k, v in sample.items()}
+
+    with torch.no_grad():
+        outputs = model.base_model.model(
+            input_ids=sample["input_ids"],
+            attention_mask=sample["attention_mask"],
+            output_hidden_states=True,
+            use_cache=False,
+        )
+    hidden_states = outputs.hidden_states
+    exit_layer = model.exit_layer
+    if exit_layer >= len(hidden_states):
+        raise RuntimeError(f"exit_layer={exit_layer} exceeds hidden state count {len(hidden_states)}")
+
+    hidden_early = hidden_states[exit_layer]
+    seq_len = hidden_early.shape[1]
+    position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+    attention_mask_bool = sample["attention_mask"].to(torch.bool)
+    adapter_hidden = model.adapter_model.forward_early_stop(
+        inputs_embeds=hidden_early,
+        attention_mask=attention_mask_bool,
+        position_ids=position_ids,
+        past_key_values=None,
+        use_cache=False,
+    )
+
+    base = hidden_early.detach().float().cpu()
+    comp = adapter_hidden.detach().float().cpu()
+    diff = torch.max(torch.abs(base - comp)).item()
+    tol = 1e-5
+    if hidden_early.dtype in {torch.float16, torch.bfloat16} or device.type == "cuda":
+        tol = 2e-3
+    if diff > tol:
+        raise AssertionError(
+            f"Identity adapter hidden mismatch (max diff={diff:.3e}, tol={tol}) "
+            f"shapes={hidden_early.shape}"
+        )
+
+    logits_base = _run_verifier_tail(model, hidden_early, attention_mask_bool, position_ids)
+    logits_adapter = _run_verifier_tail(model, adapter_hidden, attention_mask_bool, position_ids)
+    logits_diff = torch.max(
+        torch.abs(logits_base.detach().float() - logits_adapter.detach().float())
+    ).item()
+    if logits_diff > tol:
+        raise AssertionError(
+            f"Identity adapter logits mismatch (max diff={logits_diff:.3e}, tol={tol})"
+        )
+    print("[DVI] Lossless identity adapter assertion passed.")
+
+
+def _assert_drafter_equal(model: KangarooModel, tokenizer) -> None:
+    """Ensure drafter logits match verifier head prior to online updates."""
+
+    if not hasattr(model, "drafter_head"):
+        raise RuntimeError("--assert-drafter-equal requires a drafter head.")
+
+    device = next(model.head_model.parameters()).device
+    if tokenizer is None:
+        raise RuntimeError("Tokenizer is required for --assert-drafter-equal")
+    sample = tokenizer("DVI drafter verification sample.", return_tensors="pt")
+    sample = {k: v.to(device) for k, v in sample.items()}
+
+    with torch.no_grad():
+        outputs = model.base_model.model(
+            input_ids=sample["input_ids"],
+            attention_mask=sample["attention_mask"],
+            output_hidden_states=True,
+            use_cache=False,
+        )
+    exit_layer = model.exit_layer
+    hidden_early = outputs.hidden_states[exit_layer]
+    position_ids = torch.arange(hidden_early.shape[1], device=device).unsqueeze(0)
+    attention_mask_bool = sample["attention_mask"].to(torch.bool)
+    adapter_hidden = model.adapter_model.forward_early_stop(
+        inputs_embeds=hidden_early,
+        attention_mask=attention_mask_bool,
+        position_ids=position_ids,
+        past_key_values=None,
+        use_cache=False,
+    )
+
+    drafter_logits = model.drafter_logits_from_hk(adapter_hidden)
+    verifier_logits = model.head_model(adapter_hidden)
+    diff = torch.max(
+        torch.abs(drafter_logits.detach().float() - verifier_logits.detach().float())
+    ).item()
+    tol = 2e-3
+    if diff > tol:
+        raise AssertionError(
+            f"Drafter logits differ from verifier head (max diff={diff:.3e} > {tol})"
+        )
+    print("[DVI] Drafter head matches verifier projection (pre-training).")
 
 
 def _draft_block(
@@ -457,7 +649,10 @@ def _draft_block(
 
     for step in range(1 + steps):
         in_tokens_small = global_tokens[:, end_index - 1 : end_index]
-        cache_length = adapter_cache[0][0].shape[2]
+        if adapter_cache and adapter_cache[0]:
+            cache_length = adapter_cache[0][0].shape[2]
+        else:
+            cache_length = 0
         assert cache_length <= end_index - 1, f"{adapter_cache[0][0].shape} - {end_index - 1}"
         if cache_length < end_index - 1:
             position_ids = global_position_ids[:, start_index - 1 : end_index]
@@ -688,12 +883,13 @@ def kangaroo_forward(
                     past_key_values_large_.append((k[:, :, :start_index, :], v[:, :, :start_index, :]))
                 model.base_model.past_key_values = past_key_values_large_
 
-            if adapter_past_key_values[0][0].shape[2] > start_index:
-                adapter_past_key_values_ = []
-                for k, v in adapter_past_key_values:
-                    adapter_past_key_values_.append((k[:, :, :start_index, :], v[:, :, :start_index, :]))
-                adapter_past_key_values = tuple(adapter_past_key_values_)
-                del adapter_past_key_values_
+            if adapter_past_key_values and adapter_past_key_values[0]:
+                if adapter_past_key_values[0][0].shape[2] > start_index:
+                    adapter_past_key_values_ = []
+                    for k, v in adapter_past_key_values:
+                        adapter_past_key_values_.append((k[:, :, :start_index, :], v[:, :, :start_index, :]))
+                    adapter_past_key_values = tuple(adapter_past_key_values_)
+                    del adapter_past_key_values_
 
             total_inference_steps += 1
 
@@ -787,6 +983,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str2bool,
         default=None,
         help="Whether to attach the drafter LoRA head (defaults to true when DVI is active).",
+    )
+    parser.add_argument(
+        "--assert-lossless",
+        type=str2bool,
+        default=False,
+        help="Assert that the identity adapter path is lossless when DVI is disabled.",
     )
     parser.add_argument(
         "--dtype",
@@ -901,9 +1103,19 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     if args.dvi_lora_alpha is None:
         args.dvi_lora_alpha = float(args.dvi_lora_rank)
 
+    if args.dvi_bridge is None:
+        args.dvi_bridge = bool(args.dvi_online)
+    if args.dvi_bridge_trainable is None:
+        args.dvi_bridge_trainable = bool(args.dvi_bridge)
+
     attach_default = bool(args.dvi_online) or bool(getattr(args, "load_lora", ""))
     if args.dvi_attach_drafter is None:
         args.dvi_attach_drafter = attach_default
+
+    if args.assert_lossless and args.dvi_online:
+        parser.error("--assert-lossless requires --dvi-online false")
+    if args.assert_drafter_equal and not args.dvi_attach_drafter:
+        parser.error("--assert-drafter-equal requires --dvi-attach-drafter true")
 
     return args
 
@@ -1081,8 +1293,16 @@ if __name__ == "__main__":
         tokenizer = AutoTokenizer.from_pretrained(args.model_id)
         do_sample = False
 
+        if args.assert_lossless:
+            _assert_lossless_identity(model, tokenizer)
+
         if args.dvi_attach_drafter or args.dvi_online or bool(args.load_lora):
-            model.attach_drafter_head(r=args.dvi_lora_rank, alpha=args.dvi_lora_alpha)
+            model.attach_drafter_head(
+                r=args.dvi_lora_rank,
+                alpha=args.dvi_lora_alpha,
+                bridge=args.dvi_bridge,
+                bridge_kind=args.dvi_bridge_kind,
+            )
 
         if args.dvi_online:
             try:
@@ -1094,7 +1314,7 @@ if __name__ == "__main__":
             dvi_device = ref_param.device
         else:
             dvi_device = torch.device("cpu")
-        configure_dvi_runtime(args, model, dvi_device)
+        configure_dvi_runtime(args, model, dvi_device, tokenizer=tokenizer)
         grad_names = [name for name, param in model.named_parameters() if param.requires_grad]
         print(f"[Kangaroo][debug] parameters requiring grad: {grad_names}")
 

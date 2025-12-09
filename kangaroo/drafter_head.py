@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import List
 
 import torch
+import math
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -30,6 +31,7 @@ class LoRALinear(nn.Module):
         if self.rank > 0:
             self.A = nn.Parameter(torch.zeros(out_f, self.rank))
             self.B = nn.Parameter(torch.zeros(self.rank, in_f))
+            nn.init.kaiming_uniform_(self.B, a=math.sqrt(5))
         else:
             self.register_parameter("A", None)
             self.register_parameter("B", None)

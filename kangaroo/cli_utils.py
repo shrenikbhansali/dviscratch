@@ -46,6 +46,25 @@ def add_dvi_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dvi-update-every", type=int, default=8)
     parser.add_argument("--dvi-buffer-size", type=int, default=2048)
     parser.add_argument(
+        "--dvi-bridge",
+        type=str2bool,
+        default=None,
+        help="Attach a trainable bridge between hk and the LoRA drafter head.",
+    )
+    parser.add_argument(
+        "--dvi-bridge-kind",
+        type=str,
+        choices=["ffn", "mha"],
+        default="ffn",
+        help="Bridge core type (feed-forward or attention).",
+    )
+    parser.add_argument(
+        "--dvi-bridge-trainable",
+        type=str2bool,
+        default=None,
+        help="Whether bridge parameters require gradients (defaults to false when bridge is disabled).",
+    )
+    parser.add_argument(
         "--dvi-store",
         type=str,
         choices=["full", "topk"],
@@ -66,6 +85,13 @@ def add_dvi_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dvi-kl-lambdamin", type=float, default=0.1)
     parser.add_argument("--dvi-entropy-weight", type=float, default=0.0)
     parser.add_argument("--max-online-train-ms", type=int, default=5)
+    parser.add_argument("--dvi-lr", type=float, default=5e-5, help="Optimizer learning rate for online DVI trainer.")
+    parser.add_argument(
+        "--dvi-store-warmup-steps",
+        type=int,
+        default=0,
+        help="When >0 and store=topk, start with full logits for this many steps before switching to top-k.",
+    )
     parser.add_argument("--load-lora", type=str, default="")
     parser.add_argument("--save-lora-every", type=int, default=0)
     parser.add_argument("--save-lora-path", type=str, default="runs/checkpoints")
@@ -81,6 +107,18 @@ def add_dvi_args(parser: argparse.ArgumentParser) -> None:
         type=str2bool,
         default=False,
         help="Print per-block speculative acceptance stats.",
+    )
+    parser.add_argument(
+        "--dvi-autograd-anomaly",
+        type=str2bool,
+        default=False,
+        help="Enable torch autograd anomaly detection (slow, for debugging).",
+    )
+    parser.add_argument(
+        "--assert-drafter-equal",
+        type=str2bool,
+        default=False,
+        help="Check drafter logits match verifier head before online training.",
     )
 
 

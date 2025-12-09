@@ -104,6 +104,8 @@ def test_store_mode_validation_full() -> None:
         schedule=make_schedule(),
         max_ms=10,
         store_mode="full",
+        desired_store_mode="full",
+        store_warmup_steps=0,
         topk=4,
         vocab_size=model.vocab_size,
         device=torch.device("cpu"),
@@ -111,7 +113,7 @@ def test_store_mode_validation_full() -> None:
     batch = make_batch(B=2, d_model=4, vocab=model.vocab_size, mode="full")
     bad = dict(batch)
     bad["z_phi"] = None
-    with pytest.raises(AssertionError, match="full mode requires z_phi and forbids z_idx/z_val"):
+    with pytest.raises(ValueError, match="full mode requires z_phi and forbids z_idx/z_val"):
         trainer.step(bad, global_step=0)
 
 
@@ -124,6 +126,8 @@ def test_store_mode_validation_topk() -> None:
         schedule=make_schedule(),
         max_ms=10,
         store_mode="topk",
+        desired_store_mode="topk",
+        store_warmup_steps=0,
         topk=2,
         vocab_size=model.vocab_size,
         device=torch.device("cpu"),
@@ -131,7 +135,7 @@ def test_store_mode_validation_topk() -> None:
     batch = make_batch(B=2, d_model=4, vocab=model.vocab_size, mode="topk", topk=2)
     bad = dict(batch)
     bad["z_phi"] = torch.randn(2, model.vocab_size)
-    with pytest.raises(AssertionError, match="topk mode requires z_idx/z_val and forbids z_phi"):
+    with pytest.raises(ValueError, match="topk mode requires z_idx/z_val and forbids z_phi"):
         trainer.step(bad, global_step=0)
 
 
@@ -150,6 +154,8 @@ def test_topk_matches_full_when_k_equals_vocab() -> None:
         schedule=schedule_full,
         max_ms=10,
         store_mode="full",
+        desired_store_mode="full",
+        store_warmup_steps=0,
         topk=model_full.vocab_size,
         vocab_size=model_full.vocab_size,
         device=torch.device("cpu"),
@@ -161,6 +167,8 @@ def test_topk_matches_full_when_k_equals_vocab() -> None:
         schedule=schedule_topk,
         max_ms=10,
         store_mode="topk",
+        desired_store_mode="topk",
+        store_warmup_steps=0,
         topk=model_topk.vocab_size,
         vocab_size=model_topk.vocab_size,
         device=torch.device("cpu"),
@@ -194,6 +202,8 @@ def test_mask_edge_cases_produce_zero_losses() -> None:
         schedule=make_schedule(),
         max_ms=10,
         store_mode="full",
+        desired_store_mode="full",
+        store_warmup_steps=0,
         topk=model.vocab_size,
         vocab_size=model.vocab_size,
         device=torch.device("cpu"),
@@ -214,6 +224,8 @@ def test_schedule_step_advances_after_step() -> None:
         schedule=schedule,
         max_ms=10,
         store_mode="full",
+        desired_store_mode="full",
+        store_warmup_steps=0,
         topk=model.vocab_size,
         vocab_size=model.vocab_size,
         device=torch.device("cpu"),
@@ -225,7 +237,7 @@ def test_schedule_step_advances_after_step() -> None:
     assert schedule.step == 2
     weights = schedule.weights()
     assert math.isclose(weights["pg"], schedule.pgmax, rel_tol=0.0, abs_tol=1e-6)
-    assert math.isclose(weights["kd"], 0.0, rel_tol=0.0, abs_tol=1e-6)
+    assert math.isclose(weights["kd"], 0.5, rel_tol=0.0, abs_tol=1e-6)
 
 
 def test_time_reporting_positive() -> None:
@@ -237,6 +249,8 @@ def test_time_reporting_positive() -> None:
         schedule=make_schedule(),
         max_ms=10,
         store_mode="full",
+        desired_store_mode="full",
+        store_warmup_steps=0,
         topk=model.vocab_size,
         vocab_size=model.vocab_size,
         device=torch.device("cpu"),
@@ -244,6 +258,10 @@ def test_time_reporting_positive() -> None:
     batch = make_rewarded_batch(make_batch(B=2, d_model=4, vocab=model.vocab_size, mode="full", seed=17))
     metrics = trainer.step(batch, global_step=0)
     assert metrics["ms"] > 0.0
+    assert metrics["over_budget_ms"] >= 0.0
+    assert "argmax_agree" in metrics
+    assert "grad_norm" in metrics
+    assert "lr" in metrics
 
 
 def test_topk_bounds_validation() -> None:
@@ -256,6 +274,8 @@ def test_topk_bounds_validation() -> None:
             schedule=make_schedule(),
             max_ms=10,
             store_mode="topk",
+            desired_store_mode="topk",
+            store_warmup_steps=0,
             topk=model.vocab_size + 1,
             vocab_size=model.vocab_size,
             device=torch.device("cpu"),
@@ -272,7 +292,23 @@ def test_frozen_parameter_audit_raises_for_requires_grad() -> None:
             schedule=make_schedule(),
             max_ms=10,
             store_mode="full",
+            desired_store_mode="full",
+            store_warmup_steps=0,
             topk=model.vocab_size,
             vocab_size=model.vocab_size,
             device=torch.device("cpu"),
         )
+
+
+def test_schedule_weights_progression() -> None:
+    sched = PiecewiseSchedule(warmup=4, kl0=1.0, klmin=0.2, pgmax=0.5)
+    w0 = sched.weights()
+    assert w0["kd"] == pytest.approx(1.0)
+    assert w0["pg"] == pytest.approx(0.0)
+    assert w0["kl"] == pytest.approx(1.0)
+
+    sched.step = 4
+    w1 = sched.weights()
+    assert w1["kd"] == pytest.approx(0.5)
+    assert w1["pg"] == pytest.approx(0.5)
+    assert w1["kl"] == pytest.approx(0.2)
