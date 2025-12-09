@@ -7,19 +7,19 @@ class PiecewiseSchedule:
     """KL→RL curriculum with explicit formulas and persistence."""
 
     def __init__(self, warmup: int, kl0: float, klmin: float, pgmax: float) -> None:
-        self.warmup = int(warmup)
+        self.warmup = max(0, int(warmup))
         self.kl0 = float(kl0)
         self.klmin = float(klmin)
         self.pgmax = float(pgmax)
+        # IMPORTANT: callers should increment AFTER applying an optimizer step.
         self.step = 0
 
     def weights(self) -> Dict[str, float]:
-        if self.step < self.warmup:
-            t = 0.0
+        if self.warmup == 0:
+            t = 1.0
         else:
-            denom = max(1, self.warmup)
-            t = min(1.0, (self.step - self.warmup) / denom)
-        kd = max(0.0, 0.5 * (1.0 - t))
+            t = min(1.0, self.step / self.warmup)
+        kd = 0.5 * (1.0 - t) + 0.5
         ce = 0.5
         pg = self.pgmax * t
         kl = self.kl0 * (1.0 - t) + self.klmin * t
